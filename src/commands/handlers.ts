@@ -23,7 +23,11 @@ import { stopRouter } from "../app/stop-router";
 import { buildManagedProfileViews } from "../domain/config";
 import { cliError } from "../domain/errors";
 import { collectMigrateAdoptability, SetupProviderDetails } from "../domain/setup";
-import { validateProvidersShape } from "../domain/providers";
+import {
+  isResponsesCompatibility,
+  ResponsesCompatibility,
+  validateProvidersShape,
+} from "../domain/providers";
 import { collectAddInput, createNonInteractiveAddError } from "../interaction/add-interactive";
 import {
   canPrompt,
@@ -245,6 +249,7 @@ export async function handleRegisteredCommand(
       let model = getSingleOption(parsed.commandOptions, "--model", false);
       let note = getSingleOption(parsed.commandOptions, "--note", false);
       let tags = parsed.commandOptions.get("--tag") ?? [];
+      let responsesCompatibility = getResponsesCompatibilityOption(parsed.commandOptions);
       let createProfile = hasFlag(parsed.commandOptions, "--create-profile");
 
       if (!providerName || !profile || !apiKey) {
@@ -262,6 +267,7 @@ export async function handleRegisteredCommand(
             baseUrl,
             note,
             tags,
+            responsesCompatibility,
           },
           (candidate) => Boolean(readProvidersFileIfExists(paths.providersPath).providers[candidate]),
           (candidate) => Boolean(readStructuredConfig(paths.configPath).profiles.find((profileView) => profileView.name === candidate))
@@ -274,6 +280,7 @@ export async function handleRegisteredCommand(
         baseUrl = prompted.baseUrl ?? null;
         note = prompted.note ?? null;
         tags = prompted.tags;
+        responsesCompatibility = prompted.responsesCompatibility;
         createProfile = createProfile || prompted.createProfile;
       }
 
@@ -292,6 +299,7 @@ export async function handleRegisteredCommand(
         model,
         note,
         tags,
+        responsesCompatibility,
         createProfile,
       });
     }
@@ -311,6 +319,7 @@ export async function handleRegisteredCommand(
       let model: string | undefined = getSingleOption(parsed.commandOptions, "--model", false) ?? undefined;
       let note: string | undefined = getSingleOption(parsed.commandOptions, "--note", false) ?? undefined;
       let tags: string[] | undefined = parsed.commandOptions.has("--tag") ? parsed.commandOptions.get("--tag") ?? [] : undefined;
+      let responsesCompatibility = getResponsesCompatibilityOption(parsed.commandOptions);
       const createProfile = hasFlag(parsed.commandOptions, "--create-profile");
       const switchToProfile = getSingleOption(parsed.commandOptions, "--switch-to", false) ?? undefined;
 
@@ -321,6 +330,7 @@ export async function handleRegisteredCommand(
         model === undefined &&
         note === undefined &&
         tags === undefined &&
+        responsesCompatibility === undefined &&
         canPrompt(runtime, ctx.options.json)
       ) {
         const provider = readProvidersFileIfExists(paths.providersPath).providers[providerName];
@@ -334,9 +344,10 @@ export async function handleRegisteredCommand(
         baseUrl = prompted.baseUrl;
         note = prompted.note;
         tags = prompted.tags;
+        responsesCompatibility = prompted.responsesCompatibility;
       }
 
-      if (profile === undefined && apiKey === undefined && baseUrl === undefined && model === undefined && note === undefined && tags === undefined) {
+      if (profile === undefined && apiKey === undefined && baseUrl === undefined && model === undefined && note === undefined && tags === undefined && responsesCompatibility === undefined) {
         throw cliError("INVALID_ARGUMENT", "edit requires at least one field to update.");
       }
 
@@ -355,6 +366,7 @@ export async function handleRegisteredCommand(
         model,
         note,
         tags,
+        responsesCompatibility,
         createProfile,
         switchToProfile,
       });
@@ -559,4 +571,15 @@ function getIntegerOption(
 function getSecondsOption(options: Map<string, string[]>, name: string): number | undefined {
   const seconds = getIntegerOption(options, name, 1, 86_400);
   return seconds === undefined ? undefined : seconds * 1_000;
+}
+
+function getResponsesCompatibilityOption(options: Map<string, string[]>): ResponsesCompatibility | undefined {
+  const value = getSingleOption(options, "--responses-compat", false);
+  if (value === null) {
+    return undefined;
+  }
+  if (!isResponsesCompatibility(value)) {
+    throw cliError("INVALID_ARGUMENT", "--responses-compat must be native, strict, or xai.");
+  }
+  return value;
 }

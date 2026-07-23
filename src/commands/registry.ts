@@ -200,7 +200,7 @@ export const COMMANDS: CommandDefinition[] = [
     group: "write",
     summary: "Update fields on a single provider record.",
     usage: [
-      "codexs edit <provider> [--profile <model-provider-id>] [--api-key <key>] [--base-url <url>] [--model <name>] [--note <text>] [--tag <tag> ...] [--json] [--codex-dir <path>]",
+      "codexs edit <provider> [--profile <model-provider-id>] [--api-key <key>] [--base-url <url>] [--model <name>] [--responses-compat <native|strict|xai>] [--note <text>] [--tag <tag> ...] [--json] [--codex-dir <path>]",
       "codexs edit <provider> --profile <model-provider-id> --model <name> --base-url <url>",
     ],
     details: [
@@ -210,6 +210,7 @@ export const COMMANDS: CommandDefinition[] = [
       "--profile is a CLI alias for the stored model_provider id.",
       "When rebinding to a new direct model_provider id, the command must be able to project base_url from --base-url, the provider record, or an existing model_providers section.",
       "Backs up providers.json and config.toml before writing.",
+      "--responses-compat selects native passthrough, general strict relay normalization, or xAI-specific filtering.",
     ],
     examples: ["codexs edit packycode --note primary", "codexs edit packycode --tag daily --tag paid --json"],
   },
@@ -220,9 +221,9 @@ export const COMMANDS: CommandDefinition[] = [
     group: "write",
     summary: "Add a managed provider.",
     usage: [
-      "codexs add <provider> --profile <model-provider-id> --model <name> --api-key <key> [--base-url <url>] [--note <text>] [--tag <tag> ...]",
+      "codexs add <provider> --profile <model-provider-id> --model <name> --api-key <key> [--base-url <url>] [--responses-compat <native|strict|xai>] [--note <text>] [--tag <tag> ...]",
       "codexs add --claude <name> --from-file <settings.json> [--note <text>] [--tag <tag> ...]",
-      "codexs add [--profile <model-provider-id>] [--model <name>] [--api-key <key>] [--base-url <url>] [--note <text>] [--tag <tag> ...]",
+      "codexs add [--profile <model-provider-id>] [--model <name>] [--api-key <key>] [--base-url <url>] [--responses-compat <native|strict|xai>] [--note <text>] [--tag <tag> ...]",
     ],
     details: [
       "Prompts only for missing required values when stdin/stdout are TTYs and --json is not set.",
@@ -233,6 +234,7 @@ export const COMMANDS: CommandDefinition[] = [
       "--profile is a CLI alias for the stored model_provider id.",
       "The command projects only model_providers sections and does not create legacy profiles sections.",
       "Use --claude to add a Claude Code provider profile from an existing settings file.",
+      "Strict Responses compatibility is the default for third-party relays; choose native only when the upstream accepts Codex namespace extensions.",
     ],
     examples: [
       "codexs add packycode --profile packycode --model gpt-5 --api-key sk-xxx --base-url https://api.example/v1",

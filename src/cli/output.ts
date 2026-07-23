@@ -130,7 +130,8 @@ function renderHumanSuccess(command: string, data: Record<string, unknown> | nul
             : "";
           const note = provider.note ? ` note=${provider.note}` : "";
           const current = provider.isActive ? " current" : "";
-          lines.push(`${provider.name}${current} -> ${provider.modelProvider}${provider.model ? ` model=${provider.model}` : ""}${tags}${note}`);
+          const compatibility = provider.responsesCompatibility ? ` responses=${provider.responsesCompatibility}` : "";
+          lines.push(`${provider.name}${current} -> ${provider.modelProvider}${provider.model ? ` model=${provider.model}` : ""}${compatibility}${tags}${note}`);
         }
       }
       break;
@@ -143,6 +144,7 @@ function renderHumanSuccess(command: string, data: Record<string, unknown> | nul
       if (provider.baseUrl) {
         lines.push(`baseUrl: ${String(provider.baseUrl)}`);
       }
+      lines.push(`responsesCompatibility: ${String(provider.responsesCompatibility ?? "strict")}`);
       if (provider.note) {
         lines.push(`note: ${String(provider.note)}`);
       }

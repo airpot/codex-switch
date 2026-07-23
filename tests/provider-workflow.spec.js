@@ -40,6 +40,8 @@ module.exports = {
             "sk-gamma",
             "--base-url",
             "https://gamma.example/v1",
+            "--responses-compat",
+            "native",
             "--json",
             "--codex-dir",
             codexDir,
@@ -48,6 +50,16 @@ module.exports = {
         assert.equal(result.payload.ok, true);
         assert.equal(result.payload.data.provider, "gamma");
         assert.equal(result.payload.data.modelProvider, "gamma");
+        let providers = JSON.parse(fs.readFileSync(path.join(toolHomeDir, "providers.json"), "utf8"));
+        assert.equal(providers.providers.gamma.responsesCompatibility, "native");
+
+        result = await runJsonCli({
+          toolHomeDir,
+          args: ["edit", "gamma", "--responses-compat", "strict", "--json", "--codex-dir", codexDir],
+        });
+        assert.equal(result.payload.ok, true);
+        providers = JSON.parse(fs.readFileSync(path.join(toolHomeDir, "providers.json"), "utf8"));
+        assert.equal(providers.providers.gamma.responsesCompatibility, "strict");
 
         result = await runJsonCli({ toolHomeDir, args: ["switch", "gamma", "--json", "--codex-dir", codexDir] });
         assert.equal(result.payload.ok, true);
@@ -80,6 +92,23 @@ module.exports = {
         assert.match(result.stdout, /Current provider: ambiguous \(first, second\)/);
         assert.match(result.stdout, /first -> freemodel/);
         assert.doesNotMatch(result.stdout, /\[(direct|copilot)\]/i);
+      },
+    },
+    {
+      name: "provider Responses compatibility values are validated",
+      async run() {
+        const codexDir = makeSandboxCopy();
+        const toolHomeDir = makeToolHomeWithManagedState();
+        const result = await runJsonCli({
+          toolHomeDir,
+          args: [
+            "add", "invalid", "--profile", "invalid", "--model", "gpt-5",
+            "--api-key", "sk-invalid", "--base-url", "https://invalid.example/v1",
+            "--responses-compat", "unknown", "--json", "--codex-dir", codexDir,
+          ],
+        });
+        assert.equal(result.payload.ok, false);
+        assert.equal(result.payload.error.code, "INVALID_ARGUMENT");
       },
     },
     {

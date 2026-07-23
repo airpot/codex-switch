@@ -1,12 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 - 2026-07-23
+
+Responses compatibility and compressed-stream hardening release.
+
+### Added
+
+- Per-provider `native`, `strict`, and `xai` Responses compatibility modes,
+  configurable with `add/edit --responses-compat`.
+- Strict relay sanitization for private Codex fields, `additional_tools`
+  promotion, null reasoning content, and optional xAI-specific filtering.
+- Request and response content-encoding support for transformed JSON bodies.
 
 ### Fixed
 
 - Added CC Switch-aligned Responses namespace compatibility: namespace tools and
   `input[].namespace` metadata are flattened before strict upstream relays, then
   restored in buffered and SSE responses.
+- Matched CC Switch's 16-hex SHA-256 suffix, de-duplicated flattened tools, and
+  kept custom tool declarations and historical calls internally consistent.
+- Forced identity encoding for streaming/transformed upstream requests and
+  rejected compressed SSE before committing corrupt bytes to Codex.
+- Selected SSE handling from the upstream response content type and preserved a
+  final event even when the stream omitted its trailing blank-line delimiter.
 
 ## 0.3.1 - 2026-07-23
 

@@ -3,7 +3,7 @@
 `codex-switch` 是一个本地优先、无需图形界面的 Codex 与 Claude Code 中转站管理工具。它提供 `codexs` 命令，用来保存多个 OpenAI-compatible provider、切换模型与密钥、自动按优先级故障转移，并在每次修改前备份 Codex 配置。
 
 - GitHub：<https://github.com/airpot/codex-switch>
-- 当前版本：`0.3.1`
+- 当前版本：`0.3.2`
 - CLI 命令：`codexs`
 - Node.js：`>=22.13`，推荐使用最新 Node.js 22 LTS
 - Codex：面向使用顶层 `model` / `model_provider` 的当前版本，建议 `0.134.0+`
@@ -45,7 +45,7 @@ codex-switch router
 安装当前稳定标签：
 
 ```bash
-npm install -g github:airpot/codex-switch#v0.3.1
+npm install -g github:airpot/codex-switch#v0.3.2
 codexs --version
 ```
 
@@ -124,6 +124,7 @@ codexs add lxapi \
   --model gpt-5.6-sol \
   --api-key '<LXAPI_API_KEY>' \
   --base-url 'https://relay-a.example.com/v1' \
+  --responses-compat strict \
   --note 'primary relay' \
   --tag primary
 
@@ -132,6 +133,7 @@ codexs add rivo \
   --model gpt-5.6-sol \
   --api-key '<RIVO_API_KEY>' \
   --base-url 'https://relay-b.example.com/v1' \
+  --responses-compat strict \
   --note 'fallback relay' \
   --tag fallback
 ```
@@ -145,6 +147,7 @@ codexs add rivo \
 | `--model` | 发送给该中转站的模型名；路由会按 provider 单独重写请求中的 model |
 | `--api-key` | 该中转站自己的上游密钥，不是本地路由 token |
 | `--base-url` | OpenAI-compatible API 根地址，通常以 `/v1` 结尾 |
+| `--responses-compat` | Responses 兼容模式：第三方中转使用 `strict`，原生扩展使用 `native`，xAI 使用 `xai` |
 | `--note` / `--tag` | 仅用于本地识别，不发送给中转站 |
 
 ### 3. 手工切换与检查
@@ -231,6 +234,18 @@ router 会在发送到 provider 前把命名空间工具压平成兼容的函数
 按原来的工具协议继续工作。这个转换同时覆盖非流式 JSON 和 SSE 流，不需要修改
 会话文件，也不需要轮换本地 token。
 
+兼容模式按 provider 独立执行，因此主站失败后，备用站可以使用不同策略：
+
+| 模式 | 用途 |
+| --- | --- |
+| `strict` | 默认。压平 namespace，清理严格第三方 Responses 网关不接受的私有字段，并保持响应可逆 |
+| `native` | 不改写请求。只用于明确支持 Codex namespace 扩展的原生 Responses 上游 |
+| `xai` | 在 `strict` 基础上增加 xAI 工具白名单及 grok-4.5 参数清理 |
+
+流式或发生兼容转换的请求会向上游强制声明 `Accept-Encoding: identity`，避免把 gzip/br
+压缩字节误当成 SSE 文本。非流式兼容响应若仍被上游压缩，router 会先解压、还原工具名，
+再移除失效的编码与长度响应头。
+
 ### 熔断状态
 
 ```bash
@@ -287,6 +302,15 @@ codexs route start
 codexs route stop
 codexs edit lxapi --model gpt-5.6-sol
 codexs edit rivo --model gpt-5.6-sol
+codexs route start
+```
+
+更新 Responses 兼容模式：
+
+```bash
+codexs route stop
+codexs edit lxapi --responses-compat strict
+codexs edit rivo --responses-compat strict
 codexs route start
 ```
 
@@ -360,6 +384,7 @@ provider 文件格式：
       "apiKey": "<LXAPI_API_KEY>",
       "model": "gpt-5.6-sol",
       "baseUrl": "https://relay-a.example.com/v1",
+      "responsesCompatibility": "strict",
       "note": "primary relay",
       "tags": ["primary"]
     }
@@ -467,6 +492,7 @@ codexs route stop --force
 | `input[n].namespace unknown_parameter` | 中转站不接受 Codex Responses 的工具命名空间字段。当前版本 router 会自动压平请求并在响应中还原；升级后执行一次 `codexs route stop`、更新工具、再 `codexs route start`。 |
 | `ETIMEDOUT` | 网络路径、DNS、TCP/TLS 或地址族选择超时。`0.3.1` 已避开受影响主机上的 Node.js IPv4/IPv6 自动竞速问题；仍出现时应比较本机直连与其他服务器的 DNS、出口 IP 和区域线路。 |
 | `stream disconnected before completion` | 上游已经开始输出后断开。为了避免重复回答或重复工具调用，router 不会在另一站重放；重新发送请求并检查中转站长连接稳定性。 |
+| 压缩 SSE 后立即断流 | `0.3.2` 会对流式/转换请求强制使用 identity 编码；若上游仍违规返回压缩 SSE，会在响应提交前切换到下一 provider，而不会向 Codex 输出损坏字节。 |
 | `ECONNREFUSED 127.0.0.1:15721` | router 没有运行或状态陈旧。运行 `codexs route status`，必要时停止陈旧状态后重新启动。 |
 | 启用路由后旧会话不可见 | 当前 `model_provider` id 发生了变化。使用 `current` / `config show` 核对，后续不要为更新 URL、token 或模型改 id。 |
 | `LIVE_STATE_DRIFT` | 路由运行期间 `config.toml` 或 `auth.json` 被其他程序改动。先检查差异，只有确认恢复备份时才使用 `route stop --force`。 |

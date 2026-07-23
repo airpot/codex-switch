@@ -11,6 +11,7 @@ export type NamespaceName = {
 export type NamespaceTransformResult = {
   body: Buffer;
   restoreMap: Map<string, NamespaceName>;
+  changed: boolean;
 };
 
 export type NamespaceSseState = {
@@ -28,7 +29,7 @@ export function flattenNamespaceToolName(namespace: string, name: string): strin
     return fullName;
   }
 
-  const hash = createHash("sha256").update(fullName, "utf8").digest("hex").slice(0, 8);
+  const hash = createHash("sha256").update(fullName, "utf8").digest("hex").slice(0, 16);
   const suffix = `__${hash}`;
   const prefixBytes = MAX_TOOL_NAME_BYTES - Buffer.byteLength(suffix, "utf8");
   let prefix = "";
@@ -47,22 +48,23 @@ export function flattenNamespaceToolName(namespace: string, name: string): strin
  */
 export function transformNamespacedRequest(body: Buffer, contentType?: string): NamespaceTransformResult {
   if (body.length === 0 || !isJsonContentType(contentType)) {
-    return { body, restoreMap: new Map() };
+    return { body, restoreMap: new Map(), changed: false };
   }
 
   let payload: unknown;
   try {
     payload = JSON.parse(body.toString("utf8"));
   } catch {
-    return { body, restoreMap: new Map() };
+    return { body, restoreMap: new Map(), changed: false };
   }
   if (!isObject(payload)) {
-    return { body, restoreMap: new Map() };
+    return { body, restoreMap: new Map(), changed: false };
   }
 
   const tools = Array.isArray(payload.tools) ? payload.tools : [];
   const namespaceTools = tools.filter((tool) => isObject(tool) && tool.type === "namespace");
   const restoreMap = new Map<string, NamespaceName>();
+  let changed = false;
   if (namespaceTools.length > 0) {
     const occupied = new Set<string>();
     for (const tool of tools) {
@@ -96,6 +98,7 @@ export function transformNamespacedRequest(body: Buffer, contentType?: string): 
       }
     }
 
+    const seenFlat = new Set<string>();
     payload.tools = tools.flatMap((tool) => {
       if (!isObject(tool) || tool.type !== "namespace") {
         return [tool];
@@ -113,27 +116,33 @@ export function transformNamespacedRequest(body: Buffer, contentType?: string): 
           return [];
         }
         const flatName = flattenNamespaceToolName(namespace, name);
+        if (seenFlat.has(flatName)) {
+          return [];
+        }
+        seenFlat.add(flatName);
         return [writeToolName(child, flatName)];
       });
     });
-
+    changed = true;
   }
 
   if (isObject(payload.tool_choice)) {
     if (payload.tool_choice.type === "namespace") {
       payload.tool_choice = "auto";
+      changed = true;
     } else {
-      rewriteNamespacedCall(payload.tool_choice, restoreMap);
+      changed = rewriteNamespacedCall(payload.tool_choice, restoreMap) || changed;
     }
   }
 
   if (payload.input !== undefined) {
-    rewriteInputItems(payload.input, restoreMap);
+    changed = rewriteInputItems(payload.input, restoreMap) || changed;
   }
 
   return {
-    body: Buffer.from(JSON.stringify(payload), "utf8"),
+    body: changed ? Buffer.from(JSON.stringify(payload), "utf8") : body,
     restoreMap,
+    changed,
   };
 }
 
@@ -199,39 +208,41 @@ export function restoreNamespacedSseChunk(
   return Buffer.from(output, "utf8");
 }
 
-function rewriteInputItems(value: unknown, restoreMap: Map<string, NamespaceName>): void {
+function rewriteInputItems(value: unknown, restoreMap: Map<string, NamespaceName>): boolean {
+  let changed = false;
   if (Array.isArray(value)) {
     for (const item of value) {
-      rewriteInputItems(item, restoreMap);
+      changed = rewriteInputItems(item, restoreMap) || changed;
     }
-    return;
+    return changed;
   }
   if (!isObject(value)) {
-    return;
+    return false;
   }
-  if (value.type === "function_call") {
-    rewriteNamespacedCall(value, restoreMap);
-  } else if (value.type === "custom_tool_call" && typeof value.namespace === "string") {
-    // Some Codex custom tools carry namespace metadata even though their name is
-    // already globally unique. Strict gateways reject the metadata field.
-    delete value.namespace;
+  if (value.type === "function_call" || value.type === "custom_tool_call") {
+    changed = rewriteNamespacedCall(value, restoreMap) || changed;
   }
   for (const child of Object.values(value)) {
-    rewriteInputItems(child, restoreMap);
+    changed = rewriteInputItems(child, restoreMap) || changed;
   }
+  return changed;
 }
 
-function rewriteNamespacedCall(value: Record<string, unknown>, restoreMap: Map<string, NamespaceName>): void {
+function rewriteNamespacedCall(value: Record<string, unknown>, restoreMap: Map<string, NamespaceName>): boolean {
   const namespace = typeof value.namespace === "string" ? value.namespace.trim() : "";
   const name = typeof value.name === "string" ? value.name.trim() : "";
   if (!namespace || !name) {
-    return;
+    return false;
   }
   const flatName = flattenNamespaceToolName(namespace, name);
-  if (restoreMap.has(flatName)) {
+  const owner = restoreMap.get(flatName);
+  if (owner && owner.namespace === namespace && owner.name === name) {
     value.name = flatName;
   }
+  // Strict gateways reject namespace metadata even on historical calls that
+  // are no longer present in the current tool declaration set.
   delete value.namespace;
+  return true;
 }
 
 function restoreValue(value: unknown, restoreMap: Map<string, NamespaceName>): boolean {

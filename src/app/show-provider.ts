@@ -1,4 +1,4 @@
-import { maskSecret } from "../domain/providers";
+import { maskSecret, resolveResponsesCompatibility } from "../domain/providers";
 import { readProviderRecord } from "../storage/providers-repo";
 import { CommandResult } from "./types";
 
@@ -11,10 +11,11 @@ export function showProvider(args: { providersPath: string; providerName: string
     data: {
       providerName: args.providerName,
       provider: args.includeSecret
-        ? provider
+        ? { ...provider, responsesCompatibility: resolveResponsesCompatibility(provider) }
         : {
             ...provider,
             apiKey: maskSecret(provider.apiKey),
+            responsesCompatibility: resolveResponsesCompatibility(provider),
           },
     },
   };

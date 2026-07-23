@@ -1,5 +1,9 @@
 import { cliError } from "../domain/errors";
-import { buildModelProviderProjection, cleanProviderRecord } from "../domain/providers";
+import {
+  buildModelProviderProjection,
+  cleanProviderRecord,
+  ResponsesCompatibility,
+} from "../domain/providers";
 import {
   applyConfigMutation,
   createConfigMutationPlan,
@@ -28,6 +32,7 @@ export function editProvider(args: {
   model?: string | null;
   note?: string | null;
   tags?: string[] | null;
+  responsesCompatibility?: ResponsesCompatibility;
   createProfile?: boolean;
   switchToProfile?: string | null;
 }): CommandResult {
@@ -64,6 +69,9 @@ export function editProvider(args: {
   if (args.tags !== undefined) {
     updatedFields.push("tags");
   }
+  if (args.responsesCompatibility !== undefined && args.responsesCompatibility !== current.responsesCompatibility) {
+    updatedFields.push("responsesCompatibility");
+  }
 
   const oldProfile = current.profile;
   const newProfile = nextProfile;
@@ -89,6 +97,7 @@ export function editProvider(args: {
     baseUrl: args.baseUrl === null ? undefined : args.baseUrl ?? current.baseUrl,
     note: args.note === null ? undefined : args.note ?? current.note,
     tags: args.tags ?? current.tags,
+    responsesCompatibility: args.responsesCompatibility ?? current.responsesCompatibility,
   });
   const isActive = document.currentModelProvider === oldProfile;
 

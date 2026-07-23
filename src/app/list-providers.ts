@@ -3,6 +3,7 @@ import { CommandResult } from "./types";
 import { inspectLiveStateDrift } from "../domain/runtime-state";
 import { readStructuredConfig } from "../storage/config-repo";
 import { readProvidersFile } from "../storage/providers-repo";
+import { resolveResponsesCompatibility, ResponsesCompatibility } from "../domain/providers";
 
 export type ProviderListItem = {
   name: string;
@@ -12,6 +13,7 @@ export type ProviderListItem = {
   isActive: boolean;
   note: string | null;
   tags: string[];
+  responsesCompatibility: ResponsesCompatibility;
 };
 
 /**
@@ -37,6 +39,7 @@ export function listProviders(providersPath: string, configPath?: string): Comma
     isActive: liveState.providerResolvable && liveState.mappedProvider === name,
     note: providers.providers[name].note ?? null,
     tags: providers.providers[name].tags ?? [],
+    responsesCompatibility: resolveResponsesCompatibility(providers.providers[name]),
   }));
 
   return {

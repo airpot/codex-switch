@@ -1,12 +1,12 @@
 # CLI Usage
 
-This document describes the current `0.3.1` repository CLI contract for `@airpot/codex-switch`.
+This document describes the current `0.3.2` repository CLI contract for `@airpot/codex-switch`.
 
 `codex-switch` is a local-first provider/model-provider management CLI for Codex. It manages local provider records and projects the active Codex route into `config.toml` and `auth.json`.
 
 ## Version
 
-Current package version: `0.3.1`
+Current package version: `0.3.2`
 
 This line targets Codex `0.134.0+`, where the active route is selected by top-level `model` plus `model_provider`. Legacy top-level `profile` and `[profiles.*]` sections may still be inspected for migration/adoption, but they are not the recommended managed route.
 
@@ -14,7 +14,7 @@ This line targets Codex `0.134.0+`, where the active route is selected by top-le
 
 ```bash
 codexs init
-codexs add packycode --profile packycode --model gpt-5 --api-key sk-xxx --base-url https://api.example/v1
+codexs add packycode --profile packycode --model gpt-5 --api-key sk-xxx --base-url https://api.example/v1 --responses-compat strict
 codexs switch packycode
 codexs status
 codexs doctor
@@ -75,14 +75,16 @@ Lists recognizable legacy config profiles with managed-state hints for adoption 
 ### `add`
 
 ```bash
-codexs add <provider> --profile <model-provider-id> --model <model> --api-key <key> [--base-url <url>] [--note <text>] [--tag <tag> ...]
+codexs add <provider> --profile <model-provider-id> --model <model> --api-key <key> [--base-url <url>] [--responses-compat <native|strict|xai>] [--note <text>] [--tag <tag> ...]
 ```
 
 Adds a provider to `providers.json`, creates or updates the matching `[model_providers.<id>]` section, and backs up managed files before writing.
 
+`strict` is the default Responses compatibility mode for third-party relays. `native` preserves Codex namespace extensions unchanged. `xai` adds xAI-specific request filtering.
+
 ### `edit`
 
-Updates selected fields on a provider record and repairs the matching model-provider projection when needed.
+Updates selected fields on a provider record and repairs the matching model-provider projection when needed. Use `--responses-compat` to change one provider without changing the behavior of other failover targets.
 
 ### `switch`
 

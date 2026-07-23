@@ -2,13 +2,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { BackupManifest } from "../domain/backup";
 import { cliError } from "../domain/errors";
+import { ResponsesCompatibility } from "../domain/providers";
 import { getBackupId } from "../domain/backups";
 import { inspectLiveStateDrift } from "../domain/runtime-state";
 import { resolveCodexDir } from "../storage/codex-paths";
 import { readStructuredConfig } from "../storage/config-repo";
 import { readProvidersFile } from "../storage/providers-repo";
 import { loadLatestManifest, loadManifestById } from "../storage/backup-repo";
-import { promptTags } from "./add-interactive";
+import { promptTags, RESPONSES_COMPATIBILITY_CHOICES } from "./add-interactive";
 import { CliPromptRuntime } from "./prompt";
 
 /**
@@ -318,19 +319,34 @@ async function promptRequiredSecret(runtime: CliPromptRuntime, label: string, de
  */
 export async function collectEditInput(
   runtime: CliPromptRuntime,
-  current: { profile: string; apiKey: string; baseUrl?: string; note?: string; tags?: string[] }
+  current: {
+    profile: string;
+    apiKey: string;
+    baseUrl?: string;
+    note?: string;
+    tags?: string[];
+    responsesCompatibility?: ResponsesCompatibility;
+  }
 ): Promise<{
   profile: string;
   apiKey: string;
   baseUrl?: string;
   note?: string;
   tags?: string[];
+  responsesCompatibility: ResponsesCompatibility;
 }> {
   const profile = (await runtime.inputText("Profile", { defaultValue: current.profile })).trim();
   const apiKey = (await runtime.inputSecret("API key")).trim() || current.apiKey;
   const baseUrl = (await runtime.inputText("Base URL (optional)", { defaultValue: current.baseUrl ?? "" })).trim();
   const note = (await runtime.inputText("Note (optional)", { defaultValue: current.note ?? "" })).trim();
   const tags = await promptTags(runtime, current.tags ?? []);
+  const currentCompatibility = current.responsesCompatibility ?? "strict";
+  const responsesCompatibility = await runtime.selectOne<ResponsesCompatibility>(
+    "Responses compatibility",
+    [...RESPONSES_COMPATIBILITY_CHOICES].sort((left, right) => {
+      return Number(right.value === currentCompatibility) - Number(left.value === currentCompatibility);
+    })
+  );
 
   return {
     profile,
@@ -338,5 +354,6 @@ export async function collectEditInput(
     baseUrl: baseUrl || undefined,
     note: note || undefined,
     tags,
+    responsesCompatibility,
   };
 }

@@ -24,9 +24,12 @@ function close(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
-function request(port, token, body = { model: "client-model", input: "hello" }) {
+function request(port, token, body = { model: "client-model", input: "hello" }, extraHeaders = {}) {
+  return requestRaw(port, token, Buffer.from(JSON.stringify(body)), extraHeaders);
+}
+
+function requestRaw(port, token, payload, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
-    const payload = Buffer.from(JSON.stringify(body));
     const req = http.request({
       host: "127.0.0.1",
       port,
@@ -36,15 +39,16 @@ function request(port, token, body = { model: "client-model", input: "hello" }) 
         authorization: `Bearer ${token}`,
         "content-type": "application/json",
         "content-length": payload.length,
+        ...extraHeaders,
       },
     });
     req.once("error", reject);
     req.once("response", (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
-      response.once("aborted", () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString(), aborted: true }));
-      response.once("error", () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString(), aborted: true }));
-      response.once("end", () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString(), aborted: false }));
+      response.once("aborted", () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks).toString(), aborted: true }));
+      response.once("error", () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks).toString(), aborted: true }));
+      response.once("end", () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks).toString(), aborted: false }));
     });
     req.end(payload);
   });
@@ -157,6 +161,212 @@ module.exports = {
           const responseBody = JSON.parse(result.body);
           assert.equal(responseBody.output[0].name, "read");
           assert.equal(responseBody.output[0].namespace, "mcp__files__");
+        } finally {
+          await close(router.server);
+          await close(upstream.server);
+        }
+      },
+    },
+    {
+      name: "strict provider forces identity encoding and restores a final SSE event without a delimiter",
+      async run() {
+        let acceptEncoding = null;
+        const upstream = await createUpstream(async (req, res) => {
+          acceptEncoding = req.headers["accept-encoding"];
+          await readBody(req);
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('data: {"type":"response.output_item.done","item":{"type":"function_call","name":"mcp__files____read"}}');
+        });
+        const router = await createTestRouter({
+          strict: { profile: "strict", apiKey: "sk", model: "m", baseUrl: upstream.baseUrl, responsesCompatibility: "strict" },
+        });
+        try {
+          const result = await request(router.port, router.token, {
+            model: "m",
+            stream: true,
+            tools: [{ type: "namespace", name: "mcp__files__", tools: [{ type: "function", name: "read", parameters: {} }] }],
+            input: "hello",
+          }, { "accept-encoding": "gzip" });
+          assert.equal(result.status, 200);
+          assert.equal(acceptEncoding, "identity");
+          assert.match(result.body, /"name":"read"/);
+          assert.match(result.body, /"namespace":"mcp__files__"/);
+        } finally {
+          await close(router.server);
+          await close(upstream.server);
+        }
+      },
+    },
+    {
+      name: "compressed strict SSE fails over before commit instead of corrupting the client stream",
+      async run() {
+        const zlib = require("node:zlib");
+        let secondaryCalls = 0;
+        const primary = await createUpstream(async (req, res) => {
+          await readBody(req);
+          const event = 'data: {"type":"response.output_item.done","item":{"type":"function_call","name":"n__f"}}\n\n';
+          const compressed = zlib.gzipSync(event);
+          res.writeHead(200, { "content-type": "text/event-stream", "content-encoding": "gzip" });
+          res.end(compressed);
+        });
+        const secondary = await createUpstream(async (req, res) => {
+          secondaryCalls += 1;
+          await readBody(req);
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('data: {"type":"response.output_item.done","item":{"type":"function_call","name":"n__f"}}\n\n');
+        });
+        const router = await createTestRouter({
+          primary: { profile: "p", apiKey: "sk", model: "m", baseUrl: primary.baseUrl, responsesCompatibility: "strict" },
+          secondary: { profile: "s", apiKey: "sk", model: "m", baseUrl: secondary.baseUrl, responsesCompatibility: "strict" },
+        });
+        try {
+          const result = await request(router.port, router.token, {
+            model: "m",
+            stream: true,
+            tools: [{ type: "namespace", name: "n", tools: [{ type: "function", name: "f", parameters: {} }] }],
+            input: "hello",
+          });
+          assert.equal(result.status, 200);
+          assert.equal(secondaryCalls, 1);
+          assert.match(result.body, /"name":"f"/);
+          assert.match(result.body, /"namespace":"n"/);
+        } finally {
+          await close(router.server);
+          await close(primary.server);
+          await close(secondary.server);
+        }
+      },
+    },
+    {
+      name: "compressed non-streaming namespace responses are decoded and restored",
+      async run() {
+        const zlib = require("node:zlib");
+        const upstream = await createUpstream(async (req, res) => {
+          await readBody(req);
+          const response = Buffer.from('{"output":[{"type":"function_call","name":"n__f","call_id":"c1"}]}');
+          const compressed = zlib.gzipSync(response);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "content-encoding": "gzip",
+            "content-length": compressed.length,
+          });
+          res.end(compressed);
+        });
+        const router = await createTestRouter({
+          strict: { profile: "s", apiKey: "sk", model: "m", baseUrl: upstream.baseUrl, responsesCompatibility: "strict" },
+        });
+        try {
+          const result = await request(router.port, router.token, {
+            model: "m",
+            tools: [{ type: "namespace", name: "n", tools: [{ type: "function", name: "f", parameters: {} }] }],
+            input: "hello",
+          });
+          assert.equal(result.status, 200);
+          assert.equal(result.headers["content-encoding"], undefined);
+          const response = JSON.parse(result.body);
+          assert.equal(response.output[0].name, "f");
+          assert.equal(response.output[0].namespace, "n");
+        } finally {
+          await close(router.server);
+          await close(upstream.server);
+        }
+      },
+    },
+    {
+      name: "provider compatibility is selected independently on each failover attempt",
+      async run() {
+        let nativeBody = null;
+        let strictBody = null;
+        const native = await createUpstream(async (req, res) => {
+          nativeBody = await readBody(req);
+          res.writeHead(500);
+          res.end("retry");
+        });
+        const strict = await createUpstream(async (req, res) => {
+          strictBody = await readBody(req);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end('{"ok":true}');
+        });
+        const router = await createTestRouter({
+          native: { profile: "n", apiKey: "sk", model: "m", baseUrl: native.baseUrl, responsesCompatibility: "native" },
+          strict: { profile: "s", apiKey: "sk", model: "m", baseUrl: strict.baseUrl, responsesCompatibility: "strict" },
+        });
+        try {
+          const result = await request(router.port, router.token, {
+            model: "m",
+            tools: [{ type: "namespace", name: "n", tools: [{ type: "function", name: "f", parameters: {} }] }],
+            input: "hello",
+          });
+          assert.equal(result.status, 200);
+          assert.equal(nativeBody.tools[0].type, "namespace");
+          assert.equal(strictBody.tools[0].type, "function");
+          assert.equal(strictBody.tools[0].name, "n__f");
+        } finally {
+          await close(router.server);
+          await close(native.server);
+          await close(strict.server);
+        }
+      },
+    },
+    {
+      name: "request compatibility errors return 400 without poisoning provider circuits",
+      async run() {
+        let upstreamCalls = 0;
+        const upstream = await createUpstream((_req, res) => {
+          upstreamCalls += 1;
+          res.end("unexpected");
+        });
+        const router = await createTestRouter({
+          strict: { profile: "s", apiKey: "sk", model: "m", baseUrl: upstream.baseUrl, responsesCompatibility: "strict" },
+        });
+        try {
+          const result = await request(router.port, router.token, {
+            model: "m",
+            tools: [
+              { type: "function", name: "n__f", parameters: {} },
+              { type: "namespace", name: "n", tools: [{ type: "function", name: "f", parameters: {} }] },
+            ],
+            input: "hello",
+          });
+          assert.equal(result.status, 400);
+          assert.equal(upstreamCalls, 0);
+          assert.equal(router.getCircuits()[0].consecutiveFailures, 0);
+          assert.equal(router.getCircuits()[0].state, "closed");
+        } finally {
+          await close(router.server);
+          await close(upstream.server);
+        }
+      },
+    },
+    {
+      name: "gzip request bodies are decoded before strict transformation",
+      async run() {
+        const zlib = require("node:zlib");
+        let seen = null;
+        let seenContentEncoding = null;
+        const upstream = await createUpstream(async (req, res) => {
+          seenContentEncoding = req.headers["content-encoding"] ?? null;
+          seen = await readBody(req);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end('{"ok":true}');
+        });
+        const router = await createTestRouter({
+          strict: { profile: "s", apiKey: "sk", model: "m", baseUrl: upstream.baseUrl, responsesCompatibility: "strict" },
+        });
+        try {
+          const raw = Buffer.from(JSON.stringify({
+            model: "m",
+            tools: [{ type: "namespace", name: "n", tools: [{ type: "function", name: "f", parameters: {} }] }],
+            input: "hello",
+          }));
+          const compressed = zlib.gzipSync(raw);
+          const result = await requestRaw(router.port, router.token, compressed, {
+            "content-encoding": "gzip",
+            "content-length": compressed.length,
+          });
+          assert.equal(result.status, 200);
+          assert.equal(seenContentEncoding, null);
+          assert.equal(seen.tools[0].name, "n__f");
         } finally {
           await close(router.server);
           await close(upstream.server);

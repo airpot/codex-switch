@@ -1,15 +1,22 @@
 import * as http from "node:http";
 import * as https from "node:https";
 import { URL } from "node:url";
-import { ProviderRecord, ProvidersFile } from "../domain/providers";
+import {
+  ProviderRecord,
+  ProvidersFile,
+  resolveResponsesCompatibility,
+} from "../domain/providers";
 import { CircuitStatus, RouterConfig, isRetryableStatus } from "../domain/router";
 import {
+  decodeContentEncodedBody,
+  parseContentEncodings,
+} from "./content-encoding";
+import {
   createNamespaceSseState,
-  NamespaceName,
   restoreNamespacedResponse,
   restoreNamespacedSseChunk,
-  transformNamespacedRequest,
 } from "./namespace-transform";
+import { prepareResponsesRequest } from "./responses-compat";
 
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const BLOCKED_REQUEST_HEADERS = new Set([
@@ -48,7 +55,12 @@ type CircuitEntry = {
 type AttemptResult =
   | { outcome: "success" }
   | { outcome: "neutral" }
-  | { outcome: "retry"; retryReason: string };
+  | {
+      outcome: "retry";
+      retryReason: string;
+      failureKind: "provider" | "request";
+      requestStatus?: 400 | 413;
+    };
 
 export type RouterServer = {
   server: http.Server;
@@ -113,32 +125,20 @@ export function createRouterServer(args: {
       return;
     }
 
-    let transformedBody: Buffer;
-    let namespaceRestoreMap: Map<string, NamespaceName>;
-    try {
-      const transformed = transformNamespacedRequest(
-        body,
-        typeof request.headers["content-type"] === "string" ? request.headers["content-type"] : undefined
-      );
-      transformedBody = transformed.body;
-      namespaceRestoreMap = transformed.restoreMap;
-    } catch (error: unknown) {
-      if (!response.headersSent && !response.destroyed) {
-        writeJson(response, 400, {
-          error: error instanceof Error ? error.message : "Failed to normalize namespace tools",
-        });
-      }
-      return;
-    }
-
     const attempted = new Set<string>();
     const failures: Array<{ provider: string; reason: string }> = [];
+    let hasProviderFailure = false;
+    let requestFailureStatus: 400 | 413 = 400;
     while (!response.destroyed) {
       const providerName = selectProvider(args.config, circuits, attempted);
       if (!providerName) {
-        const statusCode = attempted.size === 0 ? 503 : 502;
+        const statusCode = attempted.size === 0 ? 503 : hasProviderFailure ? 502 : requestFailureStatus;
         writeJson(response, statusCode, {
-          error: attempted.size === 0 ? "All provider circuits are cooling down" : "All available providers failed",
+          error: attempted.size === 0
+            ? "All provider circuits are cooling down"
+            : hasProviderFailure
+              ? "All available providers failed"
+              : "Request is incompatible with all configured providers",
           attempts: failures,
         });
         return;
@@ -149,11 +149,10 @@ export function createRouterServer(args: {
       const result = await forwardAttempt({
         request,
         response,
-        body: transformedBody,
+        body,
         providerName,
         provider,
         config: args.config,
-        namespaceRestoreMap,
       });
 
       if (result.outcome === "success") {
@@ -167,8 +166,15 @@ export function createRouterServer(args: {
 
       const reason = result.retryReason;
       failures.push({ provider: providerName, reason });
-      markCircuitFailure(circuits.get(providerName)!, args.config);
-      args.logger?.(`provider=${providerName} failover=${reason}`);
+      if (result.failureKind === "provider") {
+        hasProviderFailure = true;
+        markCircuitFailure(circuits.get(providerName)!, args.config);
+        args.logger?.(`provider=${providerName} failover=${reason}`);
+      } else {
+        requestFailureStatus = result.requestStatus ?? requestFailureStatus;
+        markCircuitNeutral(circuits.get(providerName)!);
+        args.logger?.(`provider=${providerName} request_rejected=${reason}`);
+      }
     }
   });
 
@@ -289,11 +295,10 @@ function forwardAttempt(args: {
   providerName: string;
   provider: ProviderRecord;
   config: RouterConfig;
-  namespaceRestoreMap: Map<string, NamespaceName>;
 }): Promise<AttemptResult> {
   return new Promise((resolve) => {
     if (!args.provider.baseUrl) {
-      resolve({ outcome: "retry", retryReason: "provider has no base URL" });
+      resolve({ outcome: "retry", retryReason: "provider has no base URL", failureKind: "provider" });
       return;
     }
 
@@ -301,18 +306,74 @@ function forwardAttempt(args: {
     try {
       target = joinProviderUrl(args.provider.baseUrl, args.request.url ?? "/");
     } catch {
-      resolve({ outcome: "retry", retryReason: "provider has an invalid base URL" });
+      resolve({ outcome: "retry", retryReason: "provider has an invalid base URL", failureKind: "provider" });
+      return;
+    }
+
+    const contentType = headerString(args.request.headers["content-type"]);
+    const compatibility = resolveResponsesCompatibility(args.provider);
+    let attemptBody = args.body;
+    let requestBodyDecoded = false;
+    if (compatibility !== "native") {
+      try {
+        const decoded = decodeContentEncodedBody(
+          args.body,
+          headerString(args.request.headers["content-encoding"])
+        );
+        attemptBody = decoded.body;
+        requestBodyDecoded = decoded.decoded;
+        if (attemptBody.length > MAX_REQUEST_BYTES) {
+          resolve({
+            outcome: "retry",
+            retryReason: "decoded request body is too large",
+            failureKind: "request",
+            requestStatus: 413,
+          });
+          return;
+        }
+      } catch (error: unknown) {
+        resolve({
+          outcome: "retry",
+          retryReason: error instanceof Error ? `request decode error (${error.message})` : "request decode error",
+          failureKind: "request",
+          requestStatus: 400,
+        });
+        return;
+      }
+    }
+    let preparedRequest;
+    try {
+      preparedRequest = prepareResponsesRequest(
+        attemptBody,
+        contentType,
+        compatibility
+      );
+    } catch (error: unknown) {
+      resolve({
+        outcome: "retry",
+        retryReason: error instanceof Error ? `request compatibility error (${error.message})` : "request compatibility error",
+        failureKind: "request",
+        requestStatus: 400,
+      });
       return;
     }
 
     const outgoingBody = rewriteRequestModel(
-      args.body,
-      typeof args.request.headers["content-type"] === "string" ? args.request.headers["content-type"] : undefined,
+      preparedRequest.body,
+      contentType,
       args.provider.model
     );
-    const headers = buildUpstreamHeaders(args.request.headers, args.provider.apiKey, outgoingBody.length);
     const transport = target.protocol === "https:" ? https : http;
-    const requestIsStreaming = isStreamingRequest(args.body, args.request.headers);
+    const requestIsStreaming = isStreamingRequest(preparedRequest.body, args.request.headers);
+    const headers = buildUpstreamHeaders(
+      args.request.headers,
+      args.provider.apiKey,
+      outgoingBody.length,
+      {
+        requestBodyDecoded,
+        forceIdentityEncoding: requestIsStreaming || preparedRequest.changed,
+      }
+    );
     let settled = false;
     let committed = false;
     let responseEnded = false;
@@ -350,7 +411,7 @@ function forwardAttempt(args: {
       }
       upstreamResponse?.destroy();
       upstreamRequest.destroy();
-      finish({ outcome: "retry", retryReason: reason });
+      finish({ outcome: "retry", retryReason: reason, failureKind: "provider" });
     };
 
     const clientAborted = (): void => {
@@ -388,12 +449,20 @@ function forwardAttempt(args: {
       if (isRetryableStatus(statusCode)) {
         candidateResponse.resume();
         candidateResponse.destroy();
-        finish({ outcome: "retry", retryReason: `HTTP ${statusCode}` });
+        finish({ outcome: "retry", retryReason: `HTTP ${statusCode}`, failureKind: "provider" });
         return;
       }
       responseOutcome = statusCode >= 200 && statusCode < 300 ? "success" : "neutral";
-      const streamResponse = requestIsStreaming && responseOutcome === "success";
-      if (!streamResponse) {
+      const streamResponse = responseOutcome === "success" && isSseResponse(candidateResponse);
+      if (streamResponse) {
+        if (requestTimer) {
+          clearTimeout(requestTimer);
+          requestTimer = null;
+        }
+        if (!firstByteTimer) {
+          firstByteTimer = setTimeout(() => fail("first-byte timeout"), args.config.firstByteTimeoutMs);
+        }
+      } else {
         if (firstByteTimer) {
           clearTimeout(firstByteTimer);
           firstByteTimer = null;
@@ -403,6 +472,38 @@ function forwardAttempt(args: {
         }
       }
 
+      const responseContentEncoding = headerString(candidateResponse.headers["content-encoding"]);
+      if (
+        streamResponse &&
+        preparedRequest.restoreMap.size > 0 &&
+        parseContentEncodings(responseContentEncoding).length > 0
+      ) {
+        candidateResponse.resume();
+        candidateResponse.destroy();
+        finish({
+          outcome: "retry",
+          retryReason: `compressed SSE response (${responseContentEncoding})`,
+          failureKind: "provider",
+        });
+        return;
+      }
+
+      const commitStreamingResponse = (): void => {
+        if (committed) {
+          return;
+        }
+        committed = true;
+        if (firstByteTimer) {
+          clearTimeout(firstByteTimer);
+          firstByteTimer = null;
+        }
+        commitUpstreamResponse(
+          args.response,
+          candidateResponse,
+          preparedRequest.restoreMap.size > 0 ? null : undefined
+        );
+      };
+
       candidateResponse.on("data", (chunk: Buffer) => {
         if (settled) {
           return;
@@ -411,27 +512,18 @@ function forwardAttempt(args: {
           bufferedChunks.push(chunk);
           return;
         }
-        if (!committed) {
-          committed = true;
-          if (firstByteTimer) {
-            clearTimeout(firstByteTimer);
-            firstByteTimer = null;
-          }
-          commitUpstreamResponse(
-            args.response,
-            candidateResponse,
-            args.namespaceRestoreMap.size > 0 ? null : undefined
-          );
-        }
         resetStreamIdleTimer();
         const outputChunk = restoreNamespacedSseChunk(
           namespaceSseState,
           chunk,
-          args.namespaceRestoreMap
+          preparedRequest.restoreMap
         );
-        if (outputChunk.length > 0 && !args.response.write(outputChunk)) {
-          candidateResponse.pause();
-          args.response.once("drain", () => candidateResponse.resume());
+        if (outputChunk.length > 0) {
+          commitStreamingResponse();
+          if (!args.response.write(outputChunk)) {
+            candidateResponse.pause();
+            args.response.once("drain", () => candidateResponse.resume());
+          }
         }
       });
       candidateResponse.once("end", () => {
@@ -443,32 +535,48 @@ function forwardAttempt(args: {
           const trailingChunk = restoreNamespacedSseChunk(
             namespaceSseState,
             Buffer.alloc(0),
-            args.namespaceRestoreMap,
+            preparedRequest.restoreMap,
             true
           );
+          if (trailingChunk.length > 0) {
+            commitStreamingResponse();
+            args.response.write(trailingChunk);
+          }
           if (!committed) {
             fail("stream ended before first byte");
             return;
-          }
-          if (trailingChunk.length > 0) {
-            args.response.write(trailingChunk);
           }
           args.response.end();
           finish({ outcome: responseOutcome });
           return;
         }
-        committed = true;
         if (requestTimer) {
           clearTimeout(requestTimer);
           requestTimer = null;
         }
-        const bufferedBody = Buffer.concat(bufferedChunks);
-        const responseBody = restoreNamespacedResponse(bufferedBody, args.namespaceRestoreMap);
+        let bufferedBody: Buffer = Buffer.concat(bufferedChunks);
+        let responseBodyDecoded = false;
+        if (
+          preparedRequest.restoreMap.size > 0 &&
+          parseContentEncodings(responseContentEncoding).length > 0
+        ) {
+          try {
+            const decoded = decodeContentEncodedBody(bufferedBody, responseContentEncoding);
+            bufferedBody = decoded.body;
+            responseBodyDecoded = decoded.decoded;
+          } catch (error: unknown) {
+            fail(error instanceof Error ? `response decode error (${error.message})` : "response decode error");
+            return;
+          }
+        }
+        const responseBody = restoreNamespacedResponse(bufferedBody, preparedRequest.restoreMap);
+        committed = true;
         if (!args.response.headersSent) {
           commitUpstreamResponse(
             args.response,
             candidateResponse,
-            args.namespaceRestoreMap.size > 0 ? responseBody.length : undefined
+            preparedRequest.restoreMap.size > 0 || responseBodyDecoded ? responseBody.length : undefined,
+            responseBodyDecoded
           );
         }
         args.response.end(responseBody);
@@ -542,7 +650,11 @@ function readRequestBody(request: http.IncomingMessage): Promise<Buffer> {
 function buildUpstreamHeaders(
   source: http.IncomingHttpHeaders,
   apiKey: string,
-  contentLength: number
+  contentLength: number,
+  options: {
+    requestBodyDecoded: boolean;
+    forceIdentityEncoding: boolean;
+  }
 ): http.OutgoingHttpHeaders {
   const headers: http.OutgoingHttpHeaders = {};
   const connectionHeaders = new Set(
@@ -551,12 +663,22 @@ function buildUpstreamHeaders(
       .filter(Boolean)
   );
   for (const [name, value] of Object.entries(source)) {
-    if (value === undefined || BLOCKED_REQUEST_HEADERS.has(name.toLowerCase()) || connectionHeaders.has(name.toLowerCase())) {
+    const lowerName = name.toLowerCase();
+    if (
+      value === undefined ||
+      BLOCKED_REQUEST_HEADERS.has(lowerName) ||
+      connectionHeaders.has(lowerName) ||
+      (options.requestBodyDecoded && lowerName === "content-encoding") ||
+      (options.forceIdentityEncoding && lowerName === "accept-encoding")
+    ) {
       continue;
     }
     headers[name] = value;
   }
   headers.authorization = `Bearer ${apiKey}`;
+  if (options.forceIdentityEncoding) {
+    headers["accept-encoding"] = "identity";
+  }
   if (contentLength > 0) {
     headers["content-length"] = contentLength;
   }
@@ -566,7 +688,8 @@ function buildUpstreamHeaders(
 function commitUpstreamResponse(
   response: http.ServerResponse,
   upstream: http.IncomingMessage,
-  contentLength?: number | null
+  contentLength?: number | null,
+  stripContentEncoding = false
 ): void {
   const headers: http.OutgoingHttpHeaders = {};
   const connectionHeaders = new Set(
@@ -578,6 +701,7 @@ function commitUpstreamResponse(
     if (
       value === undefined ||
       (contentLength !== undefined && name.toLowerCase() === "content-length") ||
+      (stripContentEncoding && name.toLowerCase() === "content-encoding") ||
       BLOCKED_RESPONSE_HEADERS.has(name.toLowerCase()) ||
       connectionHeaders.has(name.toLowerCase())
     ) {
@@ -589,6 +713,14 @@ function commitUpstreamResponse(
     headers["content-length"] = contentLength;
   }
   response.writeHead(upstream.statusCode ?? 502, upstream.statusMessage, headers);
+}
+
+function isSseResponse(response: http.IncomingMessage): boolean {
+  return headerString(response.headers["content-type"])?.toLowerCase().includes("text/event-stream") ?? false;
+}
+
+function headerString(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value.join(", ") : value;
 }
 
 function writeJson(response: http.ServerResponse, statusCode: number, payload: unknown): void {

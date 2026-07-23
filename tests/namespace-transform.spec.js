@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const {
   createNamespaceSseState,
   flattenNamespaceToolName,
@@ -25,7 +26,13 @@ module.exports = {
               tools: [
                 { type: "function", name: "read", parameters: {} },
                 { type: "function", name: "write", parameters: {} },
+                { type: "function", name: "write", parameters: {} },
               ],
+            },
+            {
+              type: "namespace",
+              name: "exec",
+              tools: [{ type: "custom", name: "exec", format: { type: "text" } }],
             },
           ],
           input: [
@@ -39,11 +46,12 @@ module.exports = {
         const payload = JSON.parse(transformed.body.toString("utf8"));
         const flatRead = flattenNamespaceToolName("mcp__files__", "read");
 
-        assert.deepEqual(payload.tools.map((tool) => tool.name), ["plain", flatRead, "mcp__files____write"]);
+        assert.deepEqual(payload.tools.map((tool) => tool.name), ["plain", flatRead, "mcp__files____write", "exec__exec"]);
         assert.equal(payload.tools.some((tool) => tool.type === "namespace"), false);
         assert.equal(payload.input[0].name, flatRead);
         assert.equal("namespace" in payload.input[0], false);
         assert.equal("namespace" in payload.input[1], false);
+        assert.equal(payload.input[1].name, "exec__exec");
         assert.equal(payload.tool_choice, "auto");
         assert.deepEqual(transformed.restoreMap.get(flatRead), { namespace: "mcp__files__", name: "read" });
 
@@ -52,6 +60,44 @@ module.exports = {
           "application/json"
         );
         assert.equal(JSON.parse(standaloneChoice.body.toString("utf8")).tool_choice, "auto");
+      },
+    },
+    {
+      name: "preserves no-op bodies and uses the CC Switch long-name hash width",
+      run() {
+        const body = Buffer.from('{ "model": "client", "input": "hello" }', "utf8");
+        const unchanged = transformNamespacedRequest(body, "application/json");
+        assert.equal(unchanged.changed, false);
+        assert.equal(unchanged.body, body);
+
+        const namespace = "mcp__srv__";
+        const name = "a".repeat(80);
+        const fullName = `${namespace}__${name}`;
+        const hash = crypto.createHash("sha256").update(fullName).digest("hex").slice(0, 16);
+        const flatName = flattenNamespaceToolName(namespace, name);
+        assert.equal(Buffer.byteLength(flatName), 64);
+        assert.equal(flatName.endsWith(`__${hash}`), true);
+      },
+    },
+    {
+      name: "rejects distinct collisions and removes unmatched strict namespace metadata",
+      run() {
+        const body = Buffer.from(JSON.stringify({
+          tools: [{ type: "namespace", name: "n", tools: [{ type: "function", name: "known", parameters: {} }] }],
+          input: [{ type: "function_call", name: "old", namespace: "n", call_id: "c1", arguments: "{}" }],
+        }));
+        const transformed = transformNamespacedRequest(body, "application/json");
+        const payload = JSON.parse(transformed.body.toString("utf8"));
+        assert.equal(payload.input[0].name, "old");
+        assert.equal("namespace" in payload.input[0], false);
+
+        const collision = Buffer.from(JSON.stringify({
+          tools: [
+            { type: "function", name: "n__known", parameters: {} },
+            { type: "namespace", name: "n", tools: [{ type: "function", name: "known", parameters: {} }] },
+          ],
+        }));
+        assert.throws(() => transformNamespacedRequest(collision, "application/json"), /collision/i);
       },
     },
     {

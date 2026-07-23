@@ -5,6 +5,15 @@ export type ModelProviderProjection = {
   wireApi: "responses";
 };
 
+/** Supported request-normalization policies for native Responses upstreams. */
+export const RESPONSES_COMPATIBILITY_MODES = ["native", "strict", "xai"] as const;
+
+/** Provider-scoped compatibility mode applied by the automatic router. */
+export type ResponsesCompatibility = (typeof RESPONSES_COMPATIBILITY_MODES)[number];
+
+/** Default policy for third-party relays managed by codex-switch. */
+export const DEFAULT_RESPONSES_COMPATIBILITY: ResponsesCompatibility = "strict";
+
 /**
  * Provider definition stored in providers.json.
  */
@@ -15,6 +24,7 @@ export type ProviderRecord = {
   baseUrl?: string;
   note?: string;
   tags?: string[];
+  responsesCompatibility?: ResponsesCompatibility;
 };
 
 /**
@@ -66,6 +76,12 @@ export function validateProvidersShape(input: unknown): ProvidersFile {
     ) {
       throw new Error(`Provider "${name}" has invalid tags.`);
     }
+    if (
+      provider.responsesCompatibility !== undefined &&
+      !isResponsesCompatibility(provider.responsesCompatibility)
+    ) {
+      throw new Error(`Provider "${name}" has an invalid responsesCompatibility.`);
+    }
 
     providers[name] = cleanProviderRecord({
       profile: provider.profile,
@@ -74,6 +90,7 @@ export function validateProvidersShape(input: unknown): ProvidersFile {
       baseUrl: provider.baseUrl as string | undefined,
       note: provider.note as string | undefined,
       tags: provider.tags as string[] | undefined,
+      responsesCompatibility: provider.responsesCompatibility as ResponsesCompatibility | undefined,
     });
   }
 
@@ -101,8 +118,25 @@ export function cleanProviderRecord(record: ProviderRecord): ProviderRecord {
   if (record.tags && record.tags.length > 0) {
     next.tags = record.tags.map((tag) => tag.trim()).filter((tag) => tag.length > 0);
   }
+  if (record.responsesCompatibility) {
+    next.responsesCompatibility = record.responsesCompatibility;
+  }
 
   return next;
+}
+
+/**
+ * Resolves the Responses compatibility policy for a provider record.
+ */
+export function resolveResponsesCompatibility(record: ProviderRecord): ResponsesCompatibility {
+  return record.responsesCompatibility ?? DEFAULT_RESPONSES_COMPATIBILITY;
+}
+
+/**
+ * Checks whether an unknown value is a supported Responses compatibility mode.
+ */
+export function isResponsesCompatibility(value: unknown): value is ResponsesCompatibility {
+  return typeof value === "string" && RESPONSES_COMPATIBILITY_MODES.includes(value as ResponsesCompatibility);
 }
 
 /**

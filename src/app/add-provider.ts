@@ -1,6 +1,8 @@
 import {
   buildModelProviderProjection,
   cleanProviderRecord,
+  DEFAULT_RESPONSES_COMPATIBILITY,
+  ResponsesCompatibility,
 } from "../domain/providers";
 import { cliError } from "../domain/errors";
 import {
@@ -31,6 +33,7 @@ export async function addProvider(args: {
   model?: string | null;
   note?: string | null;
   tags: string[];
+  responsesCompatibility?: ResponsesCompatibility;
   createProfile?: boolean;
 }): Promise<CommandResult> {
   ensureDir(args.codexDir);
@@ -78,6 +81,7 @@ export async function addProvider(args: {
         baseUrl: args.baseUrl ?? undefined,
         note: args.note ?? undefined,
         tags: args.tags,
+        responsesCompatibility: args.responsesCompatibility ?? DEFAULT_RESPONSES_COMPATIBILITY,
       }),
     },
   };
@@ -103,6 +107,7 @@ export async function addProvider(args: {
         model: providerModel,
         modelProvider: args.profile,
         profile: args.profile,
+        responsesCompatibility: args.responsesCompatibility ?? DEFAULT_RESPONSES_COMPATIBILITY,
         createdProfileSections: configPlan.createdProfileSections,
         createdModelProviderSections: configPlan.createdModelProviderSections,
         deletedProfileSections: configPlan.deletedProfileSections,

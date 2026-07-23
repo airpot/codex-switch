@@ -1,7 +1,16 @@
 import { cliError } from "../domain/errors";
-import { CliPromptRuntime } from "./prompt";
+import {
+  DEFAULT_RESPONSES_COMPATIBILITY,
+  ResponsesCompatibility,
+} from "../domain/providers";
+import { CliPromptRuntime, PromptChoice } from "./prompt";
 
 export const COMMON_TAG_CHOICES = ["free", "paid", "daily", "backup"] as const;
+export const RESPONSES_COMPATIBILITY_CHOICES: PromptChoice<ResponsesCompatibility>[] = [
+  { value: "strict", label: "Strict", hint: "namespace compatibility for third-party relays" },
+  { value: "native", label: "Native", hint: "pass native Responses fields through unchanged" },
+  { value: "xai", label: "xAI", hint: "strict mode plus xAI-specific field filtering" },
+];
 
 type AddPromptDefaults = {
   providerName?: string | null;
@@ -11,6 +20,7 @@ type AddPromptDefaults = {
   baseUrl?: string | null;
   note?: string | null;
   tags: string[];
+  responsesCompatibility?: ResponsesCompatibility | null;
 };
 
 type PromptedAddInput = {
@@ -22,6 +32,7 @@ type PromptedAddInput = {
   baseUrl?: string | null;
   note?: string | null;
   tags: string[];
+  responsesCompatibility: ResponsesCompatibility;
 };
 
 
@@ -51,6 +62,10 @@ export async function collectAddInput(
     : defaults.baseUrl ?? normalizeOptionalValue(await runtime.inputText("Base URL (optional)"));
   const note = defaults.note ?? normalizeOptionalValue(await runtime.inputText("Note (optional)"));
   const tags = defaults.tags.length > 0 ? defaults.tags : await promptTags(runtime);
+  const responsesCompatibility = defaults.responsesCompatibility ?? await runtime.selectOne<ResponsesCompatibility>(
+    "Responses compatibility",
+    RESPONSES_COMPATIBILITY_CHOICES
+  );
 
   return {
     providerName,
@@ -61,6 +76,7 @@ export async function collectAddInput(
     baseUrl,
     note,
     tags,
+    responsesCompatibility: responsesCompatibility ?? DEFAULT_RESPONSES_COMPATIBILITY,
   };
 }
 

@@ -2,7 +2,7 @@
 
 This file is the current AI-facing fact sheet for `@airpot/codex-switch`.
 
-Current repository version: `0.3.1`
+Current repository version: `0.3.2`
 
 Current fact sources:
 
