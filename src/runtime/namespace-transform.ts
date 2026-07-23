@@ -117,12 +117,13 @@ export function transformNamespacedRequest(body: Buffer, contentType?: string): 
       });
     });
 
-    if (isObject(payload.tool_choice)) {
-      if (payload.tool_choice.type === "namespace") {
-        payload.tool_choice = "auto";
-      } else {
-        rewriteNamespacedCall(payload.tool_choice, restoreMap);
-      }
+  }
+
+  if (isObject(payload.tool_choice)) {
+    if (payload.tool_choice.type === "namespace") {
+      payload.tool_choice = "auto";
+    } else {
+      rewriteNamespacedCall(payload.tool_choice, restoreMap);
     }
   }
 
@@ -312,7 +313,10 @@ function readToolName(tool: Record<string, unknown>): string | null {
 }
 
 function writeToolName(tool: Record<string, unknown>, name: string): Record<string, unknown> {
-  const next: Record<string, unknown> = { ...tool, name };
+  const next: Record<string, unknown> = { ...tool };
+  if (typeof tool.name === "string" || !isObject(tool.function)) {
+    next.name = name;
+  }
   if (isObject(tool.function)) {
     next.function = { ...tool.function, name };
   }

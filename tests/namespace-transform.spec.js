@@ -46,6 +46,12 @@ module.exports = {
         assert.equal("namespace" in payload.input[1], false);
         assert.equal(payload.tool_choice, "auto");
         assert.deepEqual(transformed.restoreMap.get(flatRead), { namespace: "mcp__files__", name: "read" });
+
+        const standaloneChoice = transformNamespacedRequest(
+          Buffer.from(JSON.stringify({ tool_choice: { type: "namespace", name: "mcp__files__" } }), "utf8"),
+          "application/json"
+        );
+        assert.equal(JSON.parse(standaloneChoice.body.toString("utf8")).tool_choice, "auto");
       },
     },
     {
