@@ -220,6 +220,17 @@ codexs route configure lxapi rivo \
 
 一旦流式内容已经发送给 Codex，后续断流不会在另一个 provider 上重放同一个请求，以避免重复回答、重复工具调用或重复计费。
 
+### Responses 工具命名空间兼容
+
+较新的 Codex Responses 请求可能包含 `type: "namespace"` 工具，以及历史
+`function_call` 项中的 `namespace` 字段。部分严格的 OpenAI-compatible 中转站
+不接受这些字段，会返回类似 `input[95].namespace unknown_parameter` 的错误。
+
+router 会在发送到 provider 前把命名空间工具压平成兼容的函数名，并移除请求中的
+`namespace` 元数据；收到响应后会恢复原始的函数名和 namespace，Codex/VSCode 仍能
+按原来的工具协议继续工作。这个转换同时覆盖非流式 JSON 和 SSE 流，不需要修改
+会话文件，也不需要轮换本地 token。
+
 ### 熔断状态
 
 ```bash
@@ -453,6 +464,7 @@ codexs route stop --force
 | 上游返回 `401` / `403` | 中转站 API key 失效或权限不足。停止路由，使用 `codexs edit <provider> --api-key ...` 更新，然后启动。 |
 | `503 All provider circuits are cooling down` | 所有 provider 都处于熔断冷却。查看 `route status` 和 `router.log`，等待冷却并修复真实上游问题。 |
 | `502 All available providers failed` | 本次请求尝试过的中转站都失败。日志会列出 provider 和失败类型；HTTP 502 本身通常来自中转网关或它的模型上游。 |
+| `input[n].namespace unknown_parameter` | 中转站不接受 Codex Responses 的工具命名空间字段。当前版本 router 会自动压平请求并在响应中还原；升级后执行一次 `codexs route stop`、更新工具、再 `codexs route start`。 |
 | `ETIMEDOUT` | 网络路径、DNS、TCP/TLS 或地址族选择超时。`0.3.1` 已避开受影响主机上的 Node.js IPv4/IPv6 自动竞速问题；仍出现时应比较本机直连与其他服务器的 DNS、出口 IP 和区域线路。 |
 | `stream disconnected before completion` | 上游已经开始输出后断开。为了避免重复回答或重复工具调用，router 不会在另一站重放；重新发送请求并检查中转站长连接稳定性。 |
 | `ECONNREFUSED 127.0.0.1:15721` | router 没有运行或状态陈旧。运行 `codexs route status`，必要时停止陈旧状态后重新启动。 |

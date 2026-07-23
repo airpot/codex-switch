@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Added CC Switch-aligned Responses namespace compatibility: namespace tools and
+  `input[].namespace` metadata are flattened before strict upstream relays, then
+  restored in buffered and SSE responses.
+
 ## 0.3.1 - 2026-07-23
 
 Independent GitHub release under `airpot/codex-switch`.

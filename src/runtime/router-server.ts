@@ -3,6 +3,13 @@ import * as https from "node:https";
 import { URL } from "node:url";
 import { ProviderRecord, ProvidersFile } from "../domain/providers";
 import { CircuitStatus, RouterConfig, isRetryableStatus } from "../domain/router";
+import {
+  createNamespaceSseState,
+  NamespaceName,
+  restoreNamespacedResponse,
+  restoreNamespacedSseChunk,
+  transformNamespacedRequest,
+} from "./namespace-transform";
 
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const BLOCKED_REQUEST_HEADERS = new Set([
@@ -106,6 +113,24 @@ export function createRouterServer(args: {
       return;
     }
 
+    let transformedBody: Buffer;
+    let namespaceRestoreMap: Map<string, NamespaceName>;
+    try {
+      const transformed = transformNamespacedRequest(
+        body,
+        typeof request.headers["content-type"] === "string" ? request.headers["content-type"] : undefined
+      );
+      transformedBody = transformed.body;
+      namespaceRestoreMap = transformed.restoreMap;
+    } catch (error: unknown) {
+      if (!response.headersSent && !response.destroyed) {
+        writeJson(response, 400, {
+          error: error instanceof Error ? error.message : "Failed to normalize namespace tools",
+        });
+      }
+      return;
+    }
+
     const attempted = new Set<string>();
     const failures: Array<{ provider: string; reason: string }> = [];
     while (!response.destroyed) {
@@ -124,10 +149,11 @@ export function createRouterServer(args: {
       const result = await forwardAttempt({
         request,
         response,
-        body,
+        body: transformedBody,
         providerName,
         provider,
         config: args.config,
+        namespaceRestoreMap,
       });
 
       if (result.outcome === "success") {
@@ -263,6 +289,7 @@ function forwardAttempt(args: {
   providerName: string;
   provider: ProviderRecord;
   config: RouterConfig;
+  namespaceRestoreMap: Map<string, NamespaceName>;
 }): Promise<AttemptResult> {
   return new Promise((resolve) => {
     if (!args.provider.baseUrl) {
@@ -295,6 +322,7 @@ function forwardAttempt(args: {
     let requestTimer: NodeJS.Timeout | null = null;
     let streamIdleTimer: NodeJS.Timeout | null = null;
     let upstreamResponse: http.IncomingMessage | null = null;
+    const namespaceSseState = createNamespaceSseState();
 
     const finish = (result: AttemptResult): void => {
       if (settled) {
@@ -389,10 +417,19 @@ function forwardAttempt(args: {
             clearTimeout(firstByteTimer);
             firstByteTimer = null;
           }
-          commitUpstreamResponse(args.response, candidateResponse);
+          commitUpstreamResponse(
+            args.response,
+            candidateResponse,
+            args.namespaceRestoreMap.size > 0 ? null : undefined
+          );
         }
         resetStreamIdleTimer();
-        if (!args.response.write(chunk)) {
+        const outputChunk = restoreNamespacedSseChunk(
+          namespaceSseState,
+          chunk,
+          args.namespaceRestoreMap
+        );
+        if (outputChunk.length > 0 && !args.response.write(outputChunk)) {
           candidateResponse.pause();
           args.response.once("drain", () => candidateResponse.resume());
         }
@@ -403,9 +440,18 @@ function forwardAttempt(args: {
           return;
         }
         if (streamResponse) {
+          const trailingChunk = restoreNamespacedSseChunk(
+            namespaceSseState,
+            Buffer.alloc(0),
+            args.namespaceRestoreMap,
+            true
+          );
           if (!committed) {
             fail("stream ended before first byte");
             return;
+          }
+          if (trailingChunk.length > 0) {
+            args.response.write(trailingChunk);
           }
           args.response.end();
           finish({ outcome: responseOutcome });
@@ -416,10 +462,16 @@ function forwardAttempt(args: {
           clearTimeout(requestTimer);
           requestTimer = null;
         }
+        const bufferedBody = Buffer.concat(bufferedChunks);
+        const responseBody = restoreNamespacedResponse(bufferedBody, args.namespaceRestoreMap);
         if (!args.response.headersSent) {
-          commitUpstreamResponse(args.response, candidateResponse);
+          commitUpstreamResponse(
+            args.response,
+            candidateResponse,
+            args.namespaceRestoreMap.size > 0 ? responseBody.length : undefined
+          );
         }
-        args.response.end(Buffer.concat(bufferedChunks));
+        args.response.end(responseBody);
         finish({ outcome: responseOutcome });
       });
       candidateResponse.once("aborted", () => fail("upstream stream aborted"));
@@ -511,7 +563,11 @@ function buildUpstreamHeaders(
   return headers;
 }
 
-function commitUpstreamResponse(response: http.ServerResponse, upstream: http.IncomingMessage): void {
+function commitUpstreamResponse(
+  response: http.ServerResponse,
+  upstream: http.IncomingMessage,
+  contentLength?: number | null
+): void {
   const headers: http.OutgoingHttpHeaders = {};
   const connectionHeaders = new Set(
     (typeof upstream.headers.connection === "string" ? upstream.headers.connection.split(",") : [])
@@ -519,10 +575,18 @@ function commitUpstreamResponse(response: http.ServerResponse, upstream: http.In
       .filter(Boolean)
   );
   for (const [name, value] of Object.entries(upstream.headers)) {
-    if (value === undefined || BLOCKED_RESPONSE_HEADERS.has(name.toLowerCase()) || connectionHeaders.has(name.toLowerCase())) {
+    if (
+      value === undefined ||
+      (contentLength !== undefined && name.toLowerCase() === "content-length") ||
+      BLOCKED_RESPONSE_HEADERS.has(name.toLowerCase()) ||
+      connectionHeaders.has(name.toLowerCase())
+    ) {
       continue;
     }
     headers[name] = value;
+  }
+  if (contentLength !== undefined && contentLength !== null) {
+    headers["content-length"] = contentLength;
   }
   response.writeHead(upstream.statusCode ?? 502, upstream.statusMessage, headers);
 }

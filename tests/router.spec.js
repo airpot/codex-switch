@@ -119,6 +119,51 @@ module.exports = {
       },
     },
     {
+      name: "router strips namespace metadata for strict upstreams and restores responses",
+      async run() {
+        let seen = null;
+        const upstream = await createUpstream(async (req, res) => {
+          seen = await readBody(req);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            output: [{
+              type: "function_call",
+              name: "mcp__files____read",
+              call_id: "c1",
+              arguments: "{}",
+            }],
+          }));
+        });
+        const router = await createTestRouter({
+          lxapi: { profile: "lxapi", apiKey: "sk-lxapi", model: "lx-model", baseUrl: upstream.baseUrl },
+        });
+        try {
+          const result = await request(router.port, router.token, {
+            model: "client-model",
+            tools: [{
+              type: "namespace",
+              name: "mcp__files__",
+              tools: [{ type: "function", name: "read", parameters: {} }],
+            }],
+            input: [{ type: "function_call", name: "read", namespace: "mcp__files__", call_id: "c1", arguments: "{}" }],
+            tool_choice: { type: "namespace", name: "mcp__files__" },
+          });
+          assert.equal(result.status, 200);
+          assert.equal(seen.tools[0].name, "mcp__files____read");
+          assert.equal("namespace" in seen.tools[0], false);
+          assert.equal(seen.input[0].name, "mcp__files____read");
+          assert.equal("namespace" in seen.input[0], false);
+          assert.equal(seen.tool_choice, "auto");
+          const responseBody = JSON.parse(result.body);
+          assert.equal(responseBody.output[0].name, "read");
+          assert.equal(responseBody.output[0].namespace, "mcp__files__");
+        } finally {
+          await close(router.server);
+          await close(upstream.server);
+        }
+      },
+    },
+    {
       name: "retryable primary response fails over to streaming secondary",
       async run() {
         let primaryCalls = 0;
