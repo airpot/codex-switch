@@ -1,0 +1,57 @@
+# dependencies
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# build outputs
+dist/
+coverage/
+*.tsbuildinfo
+*.tgz
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# environment
+.env
+.env.*
+!.env.example
+
+# editor and OS files
+.vscode/
+.idea/
+bin/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# local tooling caches
+.npm-cache-local/
+.eslintcache
+.parcel-cache/
+.next/
+.nuxt/
+.svelte-kit/
+vite.svg
+tmp/
+temp/
+
+dev-codex
+
+# agents
+.omo
+.agents
+.claude
+
+# github-router-master
+github-router-master

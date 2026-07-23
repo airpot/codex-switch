@@ -1,0 +1,51 @@
+{
+  "name": "@airpot/codex-switch",
+  "version": "0.3.1",
+  "description": "Local-first CLI for managing and switching Codex and Claude Code provider routing.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "codexs": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "codex",
+    "cli",
+    "switch",
+    "provider",
+    "profile",
+    "automation"
+  ],
+  "engines": {
+    "node": ">=20.12"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/airpot/codex-switch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/airpot/codex-switch/issues"
+  },
+  "homepage": "https://github.com/airpot/codex-switch#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "prepare": "npm run build",
+    "start": "node ./dist/cli.js",
+    "test": "npm run build && node tests/run-tests.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.3",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "inquirer": "^13.4.3"
+  }
+}
