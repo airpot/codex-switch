@@ -5,7 +5,7 @@
 - GitHub：<https://github.com/airpot/codex-switch>
 - 当前版本：`0.3.1`
 - CLI 命令：`codexs`
-- Node.js：`>=20.12`，推荐 Node.js 22 LTS
+- Node.js：`>=22.13`，推荐使用最新 Node.js 22 LTS
 - Codex：面向使用顶层 `model` / `model_provider` 的当前版本，建议 `0.134.0+`
 
 > 注意：项目已经独立发布到 GitHub，但尚未发布到 npm registry。当前请通过 GitHub 安装，不要安装 npm 上由其他项目占用的无作用域 `codex-switch` 包。

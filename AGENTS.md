@@ -6,7 +6,7 @@
 
 ## Build, Test, and Development Commands
 
-Use Node.js `>=18`.
+Use Node.js `>=22.13`.
 
 - `npm run build` compiles `src/**/*.ts` into `dist/` via `scripts/build.cjs`.
 - `npm test` rebuilds the CLI and runs the test harness in `tests/run-tests.js`.

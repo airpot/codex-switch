@@ -12,7 +12,7 @@ node dist/cli.js --help  # Run built CLI locally
 npm pack --dry-run     # Preview publishable package
 ```
 
-Node.js `>=18` required. Single runtime dependency: `inquirer`.
+Node.js `>=22.13` required. Single runtime dependency: `inquirer`.
 
 ## Running a Single Test Suite
 
