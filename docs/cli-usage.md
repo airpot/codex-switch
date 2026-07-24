@@ -52,13 +52,17 @@ Reports target Codex directory, tool-home root, current model route, mapping sta
 
 Stores strict automatic-routing priority and circuit-breaker settings. The listener is restricted to `127.0.0.1`. Optional controls include `--port`, `--failure-threshold`, `--cooldown-seconds`, `--first-byte-timeout-seconds`, `--stream-idle-timeout-seconds`, and `--request-timeout-seconds`.
 
+Selection is not sticky across requests. The first configured provider remains primary; later providers are used only for a failed current attempt or while an earlier provider circuit is cooling. A cooled provider is restored through an automatic half-open probe. For a subscription primary and metered fallback, configure the subscription provider first.
+
 ### `route start`
 
 Starts the authenticated headless worker, waits for health, and then backs up and projects Codex onto its localhost Responses endpoint. The local bearer token is reused across normal stop/start cycles; pass `--rotate-token` to replace it explicitly. Every configured provider requires `baseUrl` and `model`.
 
 ### `route status`
 
-Reports configured order, process health, and live circuit state without returning the local token or upstream API keys. Runtime attempt details are written to `~/.config/codex-switch/router.log`; entries include the provider, upstream status, and sanitized request id.
+Reports configured order, process health, and live circuit state without returning the local token or upstream API keys. Runtime details are written to `~/.config/codex-switch/router.log`. Cache traces contain only short hashes and routing metadata. Attempt entries include the actual provider, primary/fallback role, upstream status, sanitized request id, and input/cached/output token usage when the upstream supplies it.
+
+The worker holds lifecycle-only SSE events before committing a response, recognizes typed SSE failures and HTTP 200 JSON semantic failures, and can fail over while no real output has reached Codex. Heartbeats do not extend the semantic-output timeout indefinitely. An upstream 429 `Retry-After` value opens that provider circuit immediately; when every circuit is cooling, the local 503 includes `Retry-After` and `retryAt`. Cooldown recovery is automatic and requires no reset command.
 
 ### `route stop`
 

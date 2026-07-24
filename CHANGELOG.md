@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+Automatic-routing stability and cache observability improvements.
+
+### Added
+
+- Classified Responses lifecycle events separately from productive output and added a bounded semantic-output timeout after pre-commit activity.
+- Detected typed semantic failures in HTTP 200 JSON responses and in SSE payloads with nested response status/error fields.
+- Corrected mislabelled SSE content types after validating the complete buffered stream.
+- Added hashed prompt-cache traces plus provider-role, cache-domain, upstream request id, and Responses token-usage attempt logs.
+- Added `Retry-After` aware 429 cooldowns and exposed the next automatic probe time on all-circuits-cooling responses.
+
+### Changed
+
+- Canonicalized forwarded JSON object-key order after compatibility and model transforms while preserving array order and semantic values.
+- Kept the first configured provider as the non-sticky primary; later providers remain per-request or circuit-cooldown fallbacks.
+- Applied longer circuit cooldowns to repeated unauthenticated and rate-limited provider responses.
+
+### Fixed
+
+- Prevented lifecycle events, heartbeats, empty events, and `[DONE]` from committing an otherwise empty Responses stream.
+- Preserved upstream status and request-id metadata when compressed SSE triggers pre-commit failover.
+- Marked a provider reached while the configured primary is cooling as `fallback` in cache and usage logs.
+
 ## 0.3.4 - 2026-07-24
 
 Prompt-cache preservation hotfix.

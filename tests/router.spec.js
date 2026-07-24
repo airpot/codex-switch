@@ -201,12 +201,17 @@ module.exports = {
       name: "compressed strict SSE fails over before commit instead of corrupting the client stream",
       async run() {
         const zlib = require("node:zlib");
+        const logs = [];
         let secondaryCalls = 0;
         const primary = await createUpstream(async (req, res) => {
           await readBody(req);
           const event = 'data: {"type":"response.output_item.done","item":{"type":"function_call","name":"n__f"}}\n\n';
           const compressed = zlib.gzipSync(event);
-          res.writeHead(200, { "content-type": "text/event-stream", "content-encoding": "gzip" });
+          res.writeHead(200, {
+            "content-type": "text/event-stream",
+            "content-encoding": "gzip",
+            "x-request-id": "compressed-primary-1",
+          });
           res.end(compressed);
         });
         const secondary = await createUpstream(async (req, res) => {
@@ -218,7 +223,7 @@ module.exports = {
         const router = await createTestRouter({
           primary: { profile: "p", apiKey: "sk", model: "m", baseUrl: primary.baseUrl, responsesCompatibility: "strict" },
           secondary: { profile: "s", apiKey: "sk", model: "m", baseUrl: secondary.baseUrl, responsesCompatibility: "strict" },
-        });
+        }, {}, (line) => logs.push(line));
         try {
           const result = await request(router.port, router.token, {
             model: "m",
@@ -230,6 +235,12 @@ module.exports = {
           assert.equal(secondaryCalls, 1);
           assert.match(result.body, /"name":"f"/);
           assert.match(result.body, /"namespace":"n"/);
+          assert.ok(logs.some((line) =>
+            line.includes("provider=primary") &&
+            line.includes("compressed SSE response") &&
+            line.includes("upstream_status=200") &&
+            line.includes("upstream_request_id=compressed-primary-1")
+          ), logs.join("\n"));
         } finally {
           await close(router.server);
           await close(primary.server);
@@ -468,6 +479,107 @@ module.exports = {
           await close(router.server);
           await close(primary.server);
           await close(secondary.server);
+        }
+      },
+    },
+    {
+      name: "lifecycle SSE events stay uncommitted so a later nested failure can fail over",
+      async run() {
+        let secondaryCalls = 0;
+        const primary = await createUpstream((_req, res) => {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write('event: response.created\ndata: {"type":"response.created","response":{"status":"in_progress"}}\n\n');
+          res.end('event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","request_id":"nested-456","error":{"message":"no capacity"}}}\n\n');
+        });
+        const secondary = await createUpstream((_req, res) => {
+          secondaryCalls += 1;
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('data: {"type":"response.output_text.delta","delta":"fallback"}\n\n');
+        });
+        const router = await createTestRouter({
+          lxapi: { profile: "lxapi", apiKey: "sk-lxapi", model: "m", baseUrl: primary.baseUrl },
+          rivo: { profile: "rivo", apiKey: "sk-rivo", model: "m", baseUrl: secondary.baseUrl },
+        });
+        try {
+          const result = await request(router.port, router.token, { model: "m", input: "hello", stream: true });
+          assert.equal(result.status, 200);
+          assert.doesNotMatch(result.body, /response\.created/);
+          assert.match(result.body, /fallback/);
+          assert.equal(secondaryCalls, 1);
+        } finally {
+          await close(router.server);
+          await close(primary.server);
+          await close(secondary.server);
+        }
+      },
+    },
+    {
+      name: "HTTP 200 Responses failures fail over and successful usage is logged",
+      async run() {
+        const logs = [];
+        let secondaryCalls = 0;
+        const primary = await createUpstream((_req, res) => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            type: "response.failed",
+            response: { status: "failed", request_id: "json-failed-1", error: { message: "upstream empty" } },
+          }));
+        });
+        const secondary = await createUpstream((_req, res) => {
+          secondaryCalls += 1;
+          res.writeHead(200, { "content-type": "application/json", "x-request-id": "json-success-2" });
+          res.end(JSON.stringify({
+            status: "completed",
+            output: [{ type: "message" }],
+            usage: {
+              input_tokens: 1000,
+              input_tokens_details: { cached_tokens: 900 },
+              output_tokens: 50,
+            },
+          }));
+        });
+        const router = await createTestRouter({
+          lxapi: { profile: "lxapi", apiKey: "sk-lxapi", model: "m", baseUrl: primary.baseUrl },
+          rivo: { profile: "rivo", apiKey: "sk-rivo", model: "m", baseUrl: secondary.baseUrl },
+        }, {}, (message) => logs.push(message));
+        try {
+          const result = await request(router.port, router.token, {
+            model: "m",
+            input: "hello",
+            stream: true,
+            prompt_cache_key: "do-not-log-this-key",
+            prompt_cache_retention: "24h",
+          });
+          assert.equal(result.status, 200);
+          assert.equal(secondaryCalls, 1);
+          assert.ok(logs.some((line) => line.includes("provider=lxapi") && line.includes("JSON response.failed") && line.includes("json-failed-1")), logs.join("\n"));
+          assert.ok(logs.some((line) => line.includes("provider=rivo") && line.includes("cache_hit_percent=90.00") && line.includes("cache_domain_changed=true")), logs.join("\n"));
+          assert.ok(logs.some((line) => line.includes("cache_trace") && line.includes("prompt_cache_key=present:") && !line.includes("do-not-log-this-key")), logs.join("\n"));
+        } finally {
+          await close(router.server);
+          await close(primary.server);
+          await close(secondary.server);
+        }
+      },
+    },
+    {
+      name: "mislabelled Responses SSE is validated and returned with the correct content type",
+      async run() {
+        const upstream = await createUpstream((_req, res) => {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.end('event: response.created\ndata: {"type":"response.created"}\n\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n');
+        });
+        const router = await createTestRouter({
+          lxapi: { profile: "lxapi", apiKey: "sk", model: "m", baseUrl: upstream.baseUrl },
+        });
+        try {
+          const result = await request(router.port, router.token, { model: "m", input: "hello", stream: true });
+          assert.equal(result.status, 200);
+          assert.match(result.headers["content-type"], /^text\/event-stream/);
+          assert.match(result.body, /response\.output_text\.delta/);
+        } finally {
+          await close(router.server);
+          await close(upstream.server);
         }
       },
     },
@@ -711,6 +823,7 @@ module.exports = {
       async run() {
         let primaryHealthy = false;
         let primaryCalls = 0;
+        const logs = [];
         const primary = await createUpstream((_req, res) => {
           primaryCalls += 1;
           res.writeHead(primaryHealthy ? 200 : 500);
@@ -720,16 +833,55 @@ module.exports = {
         const router = await createTestRouter({
           lxapi: { profile: "lxapi", apiKey: "sk-lxapi", model: "lx", baseUrl: primary.baseUrl },
           rivo: { profile: "rivo", apiKey: "sk-rivo", model: "rivo", baseUrl: secondary.baseUrl },
-        }, { failureThreshold: 1, cooldownMs: 50 });
+        }, { failureThreshold: 1, cooldownMs: 50 }, (line) => logs.push(line));
         try {
           assert.equal((await request(router.port, router.token)).body, "secondary");
           assert.equal((await request(router.port, router.token)).body, "secondary");
           assert.equal(primaryCalls, 1);
+          assert.ok(logs.some((line) =>
+            line.includes("provider=rivo") &&
+            line.includes("outcome=success") &&
+            line.includes("attempt_role=fallback") &&
+            line.includes("cache_domain_changed=true")
+          ), logs.join("\n"));
           primaryHealthy = true;
           await new Promise((resolve) => setTimeout(resolve, 70));
           assert.equal((await request(router.port, router.token)).body, "primary");
           assert.equal(primaryCalls, 2);
           assert.equal(router.getCircuits()[0].state, "closed");
+        } finally {
+          await close(router.server);
+          await close(primary.server);
+          await close(secondary.server);
+        }
+      },
+    },
+    {
+      name: "429 Retry-After immediately cools the primary without changing provider priority",
+      async run() {
+        let primaryCalls = 0;
+        let secondaryCalls = 0;
+        const primary = await createUpstream((_req, res) => {
+          primaryCalls += 1;
+          res.writeHead(429, { "retry-after": "60", "x-request-id": "rate-limit-1" });
+          res.end("rate limited");
+        });
+        const secondary = await createUpstream((_req, res) => {
+          secondaryCalls += 1;
+          res.end("secondary");
+        });
+        const router = await createTestRouter({
+          lxapi: { profile: "lxapi", apiKey: "sk-lxapi", model: "m", baseUrl: primary.baseUrl },
+          rivo: { profile: "rivo", apiKey: "sk-rivo", model: "m", baseUrl: secondary.baseUrl },
+        }, { failureThreshold: 3, cooldownMs: 1000 });
+        try {
+          assert.equal((await request(router.port, router.token)).body, "secondary");
+          assert.equal((await request(router.port, router.token)).body, "secondary");
+          assert.equal(primaryCalls, 1);
+          assert.equal(secondaryCalls, 2);
+          const circuit = router.getCircuits()[0];
+          assert.equal(circuit.state, "open");
+          assert.match(circuit.retryAt, /^\d{4}-\d{2}-\d{2}T/);
         } finally {
           await close(router.server);
           await close(primary.server);

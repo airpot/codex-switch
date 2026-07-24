@@ -176,6 +176,10 @@ codexs route status
 
 顺序是严格的：每个新请求优先使用 `lxapi`，只有符合故障切换条件时才尝试 `rivo`。
 
+如果 `lxapi` 是包月站、`rivo` 是计费站，请始终把 `lxapi` 放在第一位。路由不会因为某次
+切换成功就把后续会话长期固定到 `rivo`；只有 `lxapi` 的熔断器处于冷却期时，新请求才会
+直接使用 `rivo`。冷却结束后会先对 `lxapi` 做一次半开探测，成功后立即恢复第一优先级。
+
 ### 已有重要会话历史时
 
 Codex/VSCode 可能按 `model_provider` id 组织或筛选会话。启用自动路由前如果已经有重要历史：
@@ -199,7 +203,7 @@ codexs route start
 | 连续失败阈值 | 3 | 达到后打开该 provider 的熔断器 |
 | 冷却时间 | 60 秒 | 冷却后允许一次半开探测 |
 | 流式首字节超时 | 60 秒 | 在没有向 Codex 输出前允许切到下一站 |
-| 流式空闲超时 | 120 秒 | 已开始的流长时间无数据时终止 |
+| 流式空闲超时 | 120 秒 | 提交前长时间没有真实输出时切换；提交后长时间没有真实数据时终止 |
 | 非流式请求超时 | 600 秒 | 等待完整响应的最大时长 |
 
 自定义示例：
@@ -219,11 +223,22 @@ codexs route configure lxapi rivo \
 - 首字节或完整请求超时。
 - `401`、`403`、`408`、`429` 和 `5xx` 等 provider 级失败。
 - Responses SSE 中的 `response.failed`、`response.incomplete`、`error` 或 `response.error` 事件。
-- 只有心跳、注释、空 `data` 和 `[DONE]` 的流；这些不会被当成真实输出，避免空流卡到超时。
+- HTTP 200 JSON 中的 `failed`、`incomplete` 或嵌套 `response.error` 语义失败。
+- 只有生命周期事件、心跳、注释、空 `data` 和 `[DONE]` 的流；这些不会单独触发向 Codex 提交响应。
+- 错标为普通文本的 SSE 会先完成语义检查，再以正确的 `text/event-stream` 类型返回。
+
+`response.created`、`response.queued` 和 `response.in_progress` 只表示上游还在处理。它们可以
+证明连接有活动，但不算模型真实输出；如果之后收到失败事件或一直没有有效内容，router
+仍可在未提交响应的前提下切换 provider。心跳也不会无限延长等待时间。
 
 `400`、`405`、`406`、`413`、`414`、`415`、`422`、`501` 被视为请求本身的问题，不会盲目换站重放。
 
 一旦流式内容已经发送给 Codex，后续断流不会在另一个 provider 上重放同一个请求，以避免重复回答、重复工具调用或重复计费。
+
+上游 `429` 若带有 `Retry-After`，router 会立即按该值冷却该 provider；未带该响应头时，
+达到熔断阈值后的冷却时间为默认值的两倍。连续 `401` / `403` 达到阈值后会使用默认值
+十倍的冷却时间，避免无效 key 持续重试。所有 provider 都在冷却时，本地 `503` 会带
+`Retry-After` 响应头和 JSON `retryAt` 时间；到期后会自动半开探测，不需要手工重置。
 
 ### Responses 工具命名空间兼容
 
@@ -247,6 +262,16 @@ router 会在发送到 provider 前把命名空间工具压平成兼容的函数
 流式或发生兼容转换的请求会向上游强制声明 `Accept-Encoding: identity`，避免把 gzip/br
 压缩字节误当成 SSE 文本。非流式兼容响应若仍被上游压缩，router 会先解压、还原工具名，
 再移除失效的编码与长度响应头。
+
+### Prompt cache 稳定性
+
+`strict` 模式保留 Codex 原始的 `prompt_cache_key` 和 `prompt_cache_retention`。完成兼容转换
+和 provider 模型替换后，router 会递归稳定 JSON 对象键顺序，但保持数组顺序和语义值不变，
+使语义相同的出站请求具有稳定字节表示。router 不会为了探测缓存额外调用模型。
+
+缓存由上游 provider 管理，`lxapi` 与 `rivo` 属于不同缓存域。切换到备用站后即使请求内容
+相同，也可能出现一次完整冷缓存；恢复 `lxapi` 后仍取决于该站缓存是否保留。路由只能保持
+请求字段和字节稳定，不能让两个中转站共享缓存。
 
 ### 熔断状态
 
@@ -489,7 +514,7 @@ codexs route stop --force
 | --- | --- |
 | `401 Unauthorized`，URL 是 `127.0.0.1:15721` | 本地 token 不匹配。检查 router 是否刚执行过 `--rotate-token`；重新加载受影响的 VSCode 窗口。正常重启不应频繁轮换 token。 |
 | 上游返回 `401` / `403` | 中转站 API key 失效或权限不足。停止路由，使用 `codexs edit <provider> --api-key ...` 更新，然后启动。 |
-| `503 All provider circuits are cooling down` | 所有 provider 都处于熔断冷却。查看 `route status` 和 `router.log`，等待冷却并修复真实上游问题。 |
+| `503 All provider circuits are cooling down` | 所有 provider 都处于熔断冷却。响应中的 `Retry-After` / `retryAt` 表示下一次自动探测时间；无需手工重置，查看 `route status` 和 `router.log` 并修复真实上游问题。 |
 | `502 All available providers failed` | 本次请求尝试过的中转站都失败。日志会列出 provider 和失败类型；HTTP 502 本身通常来自中转网关或它的模型上游。 |
 | `input[n].namespace unknown_parameter` | 中转站不接受 Codex Responses 的工具命名空间字段。当前版本 router 会自动压平请求并在响应中还原；升级后执行一次 `codexs route stop`、更新工具、再 `codexs route start`。 |
 | `ETIMEDOUT` | 网络路径、DNS、TCP/TLS 或地址族选择超时。`0.3.1` 已避开受影响主机上的 Node.js IPv4/IPv6 自动竞速问题；仍出现时应比较本机直连与其他服务器的 DNS、出口 IP 和区域线路。 |
@@ -502,9 +527,21 @@ codexs route stop --force
 | 启用路由后旧会话不可见 | 当前 `model_provider` id 发生了变化。使用 `current` / `config show` 核对，后续不要为更新 URL、token 或模型改 id。 |
 | `LIVE_STATE_DRIFT` | 路由运行期间 `config.toml` 或 `auth.json` 被其他程序改动。先检查差异，只有确认恢复备份时才使用 `route stop --force`。 |
 
-路由日志不会记录 API key 或本地 bearer token。每次尝试会记录类似
-`provider=lxapi outcome=success upstream_status=200 upstream_request_id=req-123`；失败切换会记录
-`provider=lxapi failover=SSE response.failed ... upstream_request_id=req-123`。
+路由日志不会记录 API key、本地 bearer token、prompt cache key 原文或对话正文。每次请求
+发送前会写一条 `cache_trace`，记录实际 provider、`primary` / `fallback` 角色、模型、cache key
+短哈希，以及 instructions/tools/input/body 的短哈希。它用于判断连续请求的缓存相关字段是否
+发生变化，不代表上游一定命中缓存。
+
+完成事件包含 usage 时，尝试日志还会记录：
+
+```text
+provider=lxapi outcome=success upstream_status=200 upstream_request_id=req-123 cache_domain=lxapi cache_domain_changed=false attempt_role=primary input_tokens=120000 cached_input_tokens=116000 output_tokens=800 cache_hit_percent=96.67
+```
+
+备用站会明确记录 `attempt_role=fallback cache_domain_changed=true`。输入不少于 50000 token 且
+命中率低于 20% 时会附加 `cache_warning=cold_large_prompt`。失败切换同样记录实际 provider、
+上游状态和 request id，例如 `provider=lxapi failover=SSE response.failed ...`。若中转站不返回
+usage 或 request id，对应字段会显示 `usage=unavailable` 或 `upstream_request_id=none`。
 
 ### 不经过 router 测试中转站
 

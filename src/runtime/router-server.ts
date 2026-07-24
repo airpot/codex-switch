@@ -18,9 +18,16 @@ import {
 } from "./namespace-transform";
 import { prepareResponsesRequest } from "./responses-compat";
 import {
+  canonicalizeJsonBody,
+  shortHash,
+  shortJsonHash,
+} from "./json-canonical";
+import {
   createResponsesSseState,
+  inspectResponsesJsonBody,
   inspectResponsesSseChunk,
   ResponsesSseFailure,
+  ResponsesUsage,
 } from "./sse-events";
 
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
@@ -54,21 +61,26 @@ const MAX_PENDING_SSE_BYTES = 1 * 1024 * 1024;
 type CircuitEntry = {
   state: "closed" | "open" | "half-open";
   consecutiveFailures: number;
-  openedAt: number | null;
+  retryAt: number | null;
   probeInFlight: boolean;
 };
 
+type AttemptMetadata = {
+  upstreamRequestId?: string;
+  upstreamStatus?: number;
+  usage?: ResponsesUsage;
+};
+
 type AttemptResult =
-  | { outcome: "success"; upstreamRequestId?: string; upstreamStatus?: number }
-  | { outcome: "neutral"; upstreamRequestId?: string; upstreamStatus?: number }
-  | {
+  | ({ outcome: "success" } & AttemptMetadata)
+  | ({ outcome: "neutral" } & AttemptMetadata)
+  | ({
       outcome: "retry";
       retryReason: string;
       failureKind: "provider" | "request";
       requestStatus?: 400 | 413;
-      upstreamRequestId?: string;
-      upstreamStatus?: number;
-    };
+      retryAfterMs?: number;
+    } & AttemptMetadata);
 
 export type RouterServer = {
   server: http.Server;
@@ -90,7 +102,7 @@ export function createRouterServer(args: {
     circuits.set(provider, {
       state: "closed",
       consecutiveFailures: 0,
-      openedAt: null,
+      retryAt: null,
       probeInFlight: false,
     });
   }
@@ -101,7 +113,7 @@ export function createRouterServer(args: {
       provider,
       state: circuit.state,
       consecutiveFailures: circuit.consecutiveFailures,
-      retryAt: circuit.openedAt === null ? null : new Date(circuit.openedAt + args.config.cooldownMs).toISOString(),
+      retryAt: circuit.retryAt === null ? null : new Date(circuit.retryAt).toISOString(),
     };
   });
 
@@ -141,6 +153,10 @@ export function createRouterServer(args: {
       const providerName = selectProvider(args.config, circuits, attempted);
       if (!providerName) {
         const statusCode = attempted.size === 0 ? 503 : hasProviderFailure ? 502 : requestFailureStatus;
+        const nextRetryAt = earliestRetryAt(circuits);
+        const retryAfterSeconds = nextRetryAt === null
+          ? null
+          : Math.max(1, Math.ceil((nextRetryAt - Date.now()) / 1_000));
         writeJson(response, statusCode, {
           error: attempted.size === 0
             ? "All provider circuits are cooling down"
@@ -148,11 +164,13 @@ export function createRouterServer(args: {
               ? "All available providers failed"
               : "Request is incompatible with all configured providers",
           attempts: failures,
-        });
+          ...(nextRetryAt === null ? {} : { retryAt: new Date(nextRetryAt).toISOString() }),
+        }, retryAfterSeconds === null ? undefined : { "retry-after": String(retryAfterSeconds) });
         return;
       }
 
       attempted.add(providerName);
+      const cacheDomainChanged = providerName !== args.config.providers[0];
       const provider = args.providers.providers[providerName];
       const result = await forwardAttempt({
         request,
@@ -161,16 +179,18 @@ export function createRouterServer(args: {
         providerName,
         provider,
         config: args.config,
+        logger: args.logger,
+        cacheDomainChanged,
       });
 
       if (result.outcome === "success") {
         markCircuitSuccess(circuits.get(providerName)!);
-        logAttempt(args.logger, providerName, result);
+        logAttempt(args.logger, providerName, result, cacheDomainChanged);
         return;
       }
       if (result.outcome === "neutral") {
         markCircuitNeutral(circuits.get(providerName)!);
-        logAttempt(args.logger, providerName, result);
+        logAttempt(args.logger, providerName, result, cacheDomainChanged);
         return;
       }
 
@@ -178,12 +198,17 @@ export function createRouterServer(args: {
       failures.push({ provider: providerName, reason });
       if (result.failureKind === "provider") {
         hasProviderFailure = true;
-        markCircuitFailure(circuits.get(providerName)!, args.config);
-        logAttempt(args.logger, providerName, result);
+        markCircuitFailure(
+          circuits.get(providerName)!,
+          args.config,
+          result.retryAfterMs,
+          failureCooldownMs(result, args.config)
+        );
+        logAttempt(args.logger, providerName, result, cacheDomainChanged);
       } else {
         requestFailureStatus = result.requestStatus ?? requestFailureStatus;
         markCircuitNeutral(circuits.get(providerName)!);
-        logAttempt(args.logger, providerName, result);
+        logAttempt(args.logger, providerName, result, cacheDomainChanged);
       }
     }
   });
@@ -195,18 +220,26 @@ export function createRouterServer(args: {
   return { server, getCircuits };
 }
 
-function logAttempt(logger: ((message: string) => void) | undefined, providerName: string, result: AttemptResult): void {
+function logAttempt(
+  logger: ((message: string) => void) | undefined,
+  providerName: string,
+  result: AttemptResult,
+  cacheDomainChanged: boolean
+): void {
   if (!logger) {
     return;
   }
   const requestId = result.upstreamRequestId ?? "none";
   const status = result.upstreamStatus === undefined ? "unknown" : String(result.upstreamStatus);
+  const cacheDomain = `cache_domain=${providerName} cache_domain_changed=${cacheDomainChanged} attempt_role=${cacheDomainChanged ? "fallback" : "primary"}`;
+  const usage = formatUsageLog(result.usage);
   if (result.outcome === "retry") {
     const category = result.failureKind === "provider" ? "failover" : "request_rejected";
-    logger(`provider=${providerName} ${category}=${result.retryReason} upstream_status=${status} upstream_request_id=${requestId}`);
+    const retryAfter = result.retryAfterMs === undefined ? "" : ` retry_after_ms=${result.retryAfterMs}`;
+    logger(`provider=${providerName} ${category}=${result.retryReason} upstream_status=${status} upstream_request_id=${requestId} ${cacheDomain}${retryAfter} ${usage}`);
     return;
   }
-  logger(`provider=${providerName} outcome=${result.outcome} upstream_status=${status} upstream_request_id=${requestId}`);
+  logger(`provider=${providerName} outcome=${result.outcome} upstream_status=${status} upstream_request_id=${requestId} ${cacheDomain} ${usage}`);
 }
 
 /**
@@ -275,7 +308,7 @@ function selectProvider(
     }
     const circuit = circuits.get(provider)!;
     if (circuit.state === "open") {
-      if (circuit.openedAt === null || now - circuit.openedAt < config.cooldownMs) {
+      if (circuit.retryAt !== null && now < circuit.retryAt) {
         continue;
       }
       circuit.state = "half-open";
@@ -295,7 +328,7 @@ function selectProvider(
 function markCircuitSuccess(circuit: CircuitEntry): void {
   circuit.state = "closed";
   circuit.consecutiveFailures = 0;
-  circuit.openedAt = null;
+  circuit.retryAt = null;
   circuit.probeInFlight = false;
 }
 
@@ -303,13 +336,42 @@ function markCircuitNeutral(circuit: CircuitEntry): void {
   circuit.probeInFlight = false;
 }
 
-function markCircuitFailure(circuit: CircuitEntry, config: RouterConfig): void {
+function markCircuitFailure(
+  circuit: CircuitEntry,
+  config: RouterConfig,
+  retryAfterMs?: number,
+  failureCooldownMsOverride?: number
+): void {
   circuit.consecutiveFailures += 1;
   circuit.probeInFlight = false;
-  if (circuit.state === "half-open" || circuit.consecutiveFailures >= config.failureThreshold) {
+  if (retryAfterMs !== undefined || circuit.state === "half-open" || circuit.consecutiveFailures >= config.failureThreshold) {
     circuit.state = "open";
-    circuit.openedAt = Date.now();
+    circuit.retryAt = Date.now() + Math.max(retryAfterMs ?? failureCooldownMsOverride ?? config.cooldownMs, 1);
   }
+}
+
+function failureCooldownMs(result: Extract<AttemptResult, { outcome: "retry" }>, config: RouterConfig): number {
+  if (result.retryAfterMs !== undefined) {
+    return result.retryAfterMs;
+  }
+  if (result.upstreamStatus === 429) {
+    return Math.min(config.cooldownMs * 2, 86_400_000);
+  }
+  if (result.upstreamStatus === 401 || result.upstreamStatus === 403) {
+    return Math.min(config.cooldownMs * 10, 86_400_000);
+  }
+  return config.cooldownMs;
+}
+
+function earliestRetryAt(circuits: Map<string, CircuitEntry>): number | null {
+  let earliest: number | null = null;
+  for (const circuit of circuits.values()) {
+    if (circuit.state !== "open" || circuit.retryAt === null) {
+      continue;
+    }
+    earliest = earliest === null ? circuit.retryAt : Math.min(earliest, circuit.retryAt);
+  }
+  return earliest;
 }
 
 function forwardAttempt(args: {
@@ -319,6 +381,8 @@ function forwardAttempt(args: {
   providerName: string;
   provider: ProviderRecord;
   config: RouterConfig;
+  logger?: (message: string) => void;
+  cacheDomainChanged: boolean;
 }): Promise<AttemptResult> {
   return new Promise((resolve) => {
     if (!args.provider.baseUrl) {
@@ -382,10 +446,20 @@ function forwardAttempt(args: {
       return;
     }
 
-    const outgoingBody = rewriteRequestModel(
-      preparedRequest.body,
-      contentType,
-      args.provider.model
+    const outgoingBody = canonicalizeJsonBody(
+      rewriteRequestModel(
+        preparedRequest.body,
+        contentType,
+        args.provider.model
+      ),
+      contentType
+    );
+    logPromptCacheTrace(
+      args.logger,
+      args.providerName,
+      args.cacheDomainChanged,
+      outgoingBody,
+      contentType
     );
     const transport = target.protocol === "https:" ? https : http;
     const requestIsStreaming = isStreamingRequest(preparedRequest.body, args.request.headers);
@@ -404,11 +478,13 @@ function forwardAttempt(args: {
     let responseOutcome: "success" | "neutral" = "success";
     const bufferedChunks: Buffer[] = [];
     let firstByteTimer: NodeJS.Timeout | null = null;
+    let semanticStartTimer: NodeJS.Timeout | null = null;
     let requestTimer: NodeJS.Timeout | null = null;
     let streamIdleTimer: NodeJS.Timeout | null = null;
     let upstreamResponse: http.IncomingMessage | null = null;
     let upstreamRequestId: string | undefined;
     let upstreamStatus: number | undefined;
+    let responseUsage: ResponsesUsage | undefined;
     const namespaceSseState = createNamespaceSseState();
     const responsesSseState = createResponsesSseState();
     const pendingSseChunks: Buffer[] = [];
@@ -431,7 +507,7 @@ function forwardAttempt(args: {
       }
       upstreamRequestId ??= requestId;
       if (committed) {
-        finish({ outcome: responseOutcome, upstreamRequestId, upstreamStatus });
+        finish({ outcome: responseOutcome, upstreamRequestId, upstreamStatus, usage: responseUsage });
         upstreamResponse?.destroy();
         upstreamRequest.destroy();
         args.response.destroy();
@@ -439,7 +515,14 @@ function forwardAttempt(args: {
         // deliver usable data. Do not poison its circuit because the stream closed late.
         return;
       }
-      finish({ outcome: "retry", retryReason: reason, failureKind: "provider", upstreamRequestId, upstreamStatus });
+      finish({
+        outcome: "retry",
+        retryReason: reason,
+        failureKind: "provider",
+        upstreamRequestId,
+        upstreamStatus,
+        usage: responseUsage,
+      });
       upstreamResponse?.destroy();
       upstreamRequest.destroy();
     };
@@ -447,7 +530,12 @@ function forwardAttempt(args: {
     const clientAborted = (): void => {
       upstreamResponse?.destroy();
       upstreamRequest.destroy();
-      finish({ outcome: committed ? responseOutcome : "neutral", upstreamRequestId, upstreamStatus });
+      finish({
+        outcome: committed ? responseOutcome : "neutral",
+        upstreamRequestId,
+        upstreamStatus,
+        usage: responseUsage,
+      });
     };
     const clientClosed = (): void => {
       if (!args.response.writableEnded) {
@@ -479,6 +567,9 @@ function forwardAttempt(args: {
       upstreamStatus = statusCode;
       upstreamRequestId = getUpstreamRequestId(candidateResponse.headers);
       if (isRetryableStatus(statusCode)) {
+        const retryAfterMs = statusCode === 429
+          ? parseRetryAfterMs(headerString(candidateResponse.headers["retry-after"]))
+          : undefined;
         candidateResponse.resume();
         candidateResponse.destroy();
         finish({
@@ -487,6 +578,7 @@ function forwardAttempt(args: {
           failureKind: "provider",
           upstreamRequestId,
           upstreamStatus,
+          ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
         });
         return;
       }
@@ -513,7 +605,6 @@ function forwardAttempt(args: {
       const responseContentEncoding = headerString(candidateResponse.headers["content-encoding"]);
       if (
         streamResponse &&
-        preparedRequest.restoreMap.size > 0 &&
         parseContentEncodings(responseContentEncoding).length > 0
       ) {
         candidateResponse.resume();
@@ -522,6 +613,8 @@ function forwardAttempt(args: {
           outcome: "retry",
           retryReason: `compressed SSE response (${responseContentEncoding})`,
           failureKind: "provider",
+          upstreamRequestId,
+          upstreamStatus,
         });
         return;
       }
@@ -534,6 +627,10 @@ function forwardAttempt(args: {
         if (firstByteTimer) {
           clearTimeout(firstByteTimer);
           firstByteTimer = null;
+        }
+        if (semanticStartTimer) {
+          clearTimeout(semanticStartTimer);
+          semanticStartTimer = null;
         }
         commitUpstreamResponse(
           args.response,
@@ -552,6 +649,7 @@ function forwardAttempt(args: {
         }
         const inspection = inspectResponsesSseChunk(responsesSseState, chunk);
         upstreamRequestId ??= inspection.requestId;
+        responseUsage = inspection.usage ?? responseUsage;
         const failure = inspection.failures[0];
         if (failure && !committed) {
           fail(formatSseFailureReason(failure), failure.requestId);
@@ -559,6 +657,8 @@ function forwardAttempt(args: {
         }
         if (inspection.hasRealData) {
           resetStreamIdleTimer();
+        } else if (inspection.hasActivity && !committed) {
+          notePreCommitActivity();
         }
         const outputChunk = restoreNamespacedSseChunk(
           namespaceSseState,
@@ -605,6 +705,7 @@ function forwardAttempt(args: {
             true
           );
           upstreamRequestId ??= trailingInspection.requestId;
+          responseUsage = trailingInspection.usage ?? responseUsage;
           const trailingFailure = trailingInspection.failures[0];
           if (trailingFailure && !committed) {
             fail(formatSseFailureReason(trailingFailure), trailingFailure.requestId);
@@ -636,7 +737,7 @@ function forwardAttempt(args: {
             return;
           }
           args.response.end();
-          finish({ outcome: responseOutcome, upstreamRequestId, upstreamStatus });
+          finish({ outcome: responseOutcome, upstreamRequestId, upstreamStatus, usage: responseUsage });
           return;
         }
         if (requestTimer) {
@@ -645,10 +746,7 @@ function forwardAttempt(args: {
         }
         let bufferedBody: Buffer = Buffer.concat(bufferedChunks);
         let responseBodyDecoded = false;
-        if (
-          preparedRequest.restoreMap.size > 0 &&
-          parseContentEncodings(responseContentEncoding).length > 0
-        ) {
+        if (parseContentEncodings(responseContentEncoding).length > 0) {
           try {
             const decoded = decodeContentEncodedBody(bufferedBody, responseContentEncoding);
             bufferedBody = decoded.body;
@@ -658,18 +756,55 @@ function forwardAttempt(args: {
             return;
           }
         }
-        const responseBody = restoreNamespacedResponse(bufferedBody, preparedRequest.restoreMap);
+
+        const bodyIsSse = requestIsStreaming && looksLikeSseBody(bufferedBody);
+        let responseBody: Buffer;
+        let responseContentType: string | undefined;
+        if (bodyIsSse) {
+          const inspection = inspectResponsesSseChunk(responsesSseState, bufferedBody, true);
+          upstreamRequestId ??= inspection.requestId;
+          responseUsage = inspection.usage ?? responseUsage;
+          const failure = inspection.failures[0];
+          if (failure) {
+            fail(formatResponsesFailureReason("SSE", failure), failure.requestId);
+            return;
+          }
+          if (!inspection.hasRealData) {
+            fail("stream ended before real data");
+            return;
+          }
+          responseBody = restoreNamespacedSseChunk(
+            namespaceSseState,
+            bufferedBody,
+            preparedRequest.restoreMap,
+            true
+          );
+          responseContentType = "text/event-stream; charset=utf-8";
+        } else {
+          const inspection = inspectResponsesJsonBody(bufferedBody);
+          if (inspection) {
+            upstreamRequestId ??= inspection.requestId;
+            responseUsage = inspection.usage ?? responseUsage;
+            const failure = inspection.failures[0];
+            if (failure && responseOutcome === "success") {
+              fail(formatResponsesFailureReason("JSON", failure), failure.requestId);
+              return;
+            }
+          }
+          responseBody = restoreNamespacedResponse(bufferedBody, preparedRequest.restoreMap);
+        }
         committed = true;
         if (!args.response.headersSent) {
           commitUpstreamResponse(
             args.response,
             candidateResponse,
-            preparedRequest.restoreMap.size > 0 || responseBodyDecoded ? responseBody.length : undefined,
-            responseBodyDecoded
+            preparedRequest.restoreMap.size > 0 || responseBodyDecoded || bodyIsSse ? responseBody.length : undefined,
+            responseBodyDecoded,
+            responseContentType
           );
         }
         args.response.end(responseBody);
-        finish({ outcome: responseOutcome, upstreamRequestId, upstreamStatus });
+        finish({ outcome: responseOutcome, upstreamRequestId, upstreamStatus, usage: responseUsage });
       });
       candidateResponse.once("aborted", () => fail("upstream stream aborted"));
       candidateResponse.once("error", (error) => fail(sanitizeNetworkError(error)));
@@ -690,6 +825,10 @@ function forwardAttempt(args: {
         clearTimeout(firstByteTimer);
         firstByteTimer = null;
       }
+      if (semanticStartTimer) {
+        clearTimeout(semanticStartTimer);
+        semanticStartTimer = null;
+      }
       if (requestTimer) {
         clearTimeout(requestTimer);
         requestTimer = null;
@@ -708,6 +847,19 @@ function forwardAttempt(args: {
         () => fail("stream idle timeout"),
         args.config.streamIdleTimeoutMs
       );
+    }
+
+    function notePreCommitActivity(): void {
+      if (firstByteTimer) {
+        clearTimeout(firstByteTimer);
+        firstByteTimer = null;
+      }
+      if (!semanticStartTimer) {
+        semanticStartTimer = setTimeout(
+          () => fail("semantic output timeout"),
+          args.config.streamIdleTimeoutMs
+        );
+      }
     }
   });
 }
@@ -778,7 +930,8 @@ function commitUpstreamResponse(
   response: http.ServerResponse,
   upstream: http.IncomingMessage,
   contentLength?: number | null,
-  stripContentEncoding = false
+  stripContentEncoding = false,
+  contentType?: string
 ): void {
   const headers: http.OutgoingHttpHeaders = {};
   const connectionHeaders = new Set(
@@ -791,6 +944,7 @@ function commitUpstreamResponse(
       value === undefined ||
       (contentLength !== undefined && name.toLowerCase() === "content-length") ||
       (stripContentEncoding && name.toLowerCase() === "content-encoding") ||
+      (contentType !== undefined && name.toLowerCase() === "content-type") ||
       BLOCKED_RESPONSE_HEADERS.has(name.toLowerCase()) ||
       connectionHeaders.has(name.toLowerCase())
     ) {
@@ -800,6 +954,9 @@ function commitUpstreamResponse(
   }
   if (contentLength !== undefined && contentLength !== null) {
     headers["content-length"] = contentLength;
+  }
+  if (contentType !== undefined) {
+    headers["content-type"] = contentType;
   }
   response.writeHead(upstream.statusCode ?? 502, upstream.statusMessage, headers);
 }
@@ -823,8 +980,12 @@ function getUpstreamRequestId(headers: http.IncomingHttpHeaders): string | undef
 }
 
 function formatSseFailureReason(failure: ResponsesSseFailure): string {
+  return formatResponsesFailureReason("SSE", failure);
+}
+
+function formatResponsesFailureReason(source: "SSE" | "JSON", failure: ResponsesSseFailure): string {
   const message = failure.message ? ` (${sanitizeLogText(failure.message)})` : "";
-  return `SSE ${failure.type}${message}`;
+  return `${source} ${failure.type}${message}`;
 }
 
 function sanitizeLogText(value: string): string {
@@ -852,12 +1013,97 @@ function isPotentialSseData(chunk: Buffer): boolean {
   });
 }
 
-function writeJson(response: http.ServerResponse, statusCode: number, payload: unknown): void {
+function looksLikeSseBody(body: Buffer): boolean {
+  const firstMeaningfulLine = body
+    .toString("utf8")
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n/)
+    .find((line) => line.trim() !== "")
+    ?.trim();
+  return Boolean(firstMeaningfulLine && /^(?::|data:|event:|id:|retry:)/i.test(firstMeaningfulLine));
+}
+
+function logPromptCacheTrace(
+  logger: ((message: string) => void) | undefined,
+  providerName: string,
+  cacheDomainChanged: boolean,
+  body: Buffer,
+  contentType: string | undefined
+): void {
+  if (!logger || body.length === 0 || !contentType || !/(?:application\/json|\+json)(?:;|$)/i.test(contentType)) {
+    return;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return;
+  }
+  const payload = parsed as Record<string, unknown>;
+  const cacheKey = typeof payload.prompt_cache_key === "string" && payload.prompt_cache_key !== ""
+    ? `present:${shortHash(payload.prompt_cache_key)}`
+    : "absent";
+  const retention = typeof payload.prompt_cache_retention === "string"
+    ? sanitizeLogText(payload.prompt_cache_retention)
+    : "absent";
+  const model = typeof payload.model === "string" ? sanitizeLogText(payload.model).slice(0, 120) : "absent";
+  logger(
+    `provider=${providerName} cache_trace attempt_role=${cacheDomainChanged ? "fallback" : "primary"} ` +
+    `cache_domain_changed=${cacheDomainChanged} model=${model} prompt_cache_key=${cacheKey} ` +
+    `prompt_cache_retention=${retention} instructions_hash=${shortJsonHash(payload.instructions)} ` +
+    `tools_hash=${shortJsonHash(payload.tools)} input_hash=${shortJsonHash(payload.input)} ` +
+    `body_hash=${shortHash(body)}`
+  );
+}
+
+function formatUsageLog(usage: ResponsesUsage | undefined): string {
+  if (!usage) {
+    return "usage=unavailable";
+  }
+  const hitRate = usage.inputTokens > 0
+    ? Math.min(100, (usage.cachedInputTokens / usage.inputTokens) * 100)
+    : 0;
+  const warning = usage.inputTokens >= 50_000 && hitRate < 20
+    ? " cache_warning=cold_large_prompt"
+    : "";
+  return `input_tokens=${usage.inputTokens} cached_input_tokens=${usage.cachedInputTokens} ` +
+    `output_tokens=${usage.outputTokens} cache_hit_percent=${hitRate.toFixed(2)}${warning}`;
+}
+
+/**
+ * Parses an HTTP Retry-After value into a bounded delay for provider cooldown.
+ */
+export function parseRetryAfterMs(value: string | undefined, now = Date.now()): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const milliseconds = Number(trimmed) * 1_000;
+    return milliseconds > 0 ? Math.min(milliseconds, 86_400_000) : undefined;
+  }
+  const timestamp = Date.parse(trimmed);
+  if (!Number.isFinite(timestamp) || timestamp <= now) {
+    return undefined;
+  }
+  return Math.min(timestamp - now, 86_400_000);
+}
+
+function writeJson(
+  response: http.ServerResponse,
+  statusCode: number,
+  payload: unknown,
+  extraHeaders: http.OutgoingHttpHeaders = {}
+): void {
   if (response.headersSent || response.destroyed) {
     return;
   }
   const body = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
   response.writeHead(statusCode, {
+    ...extraHeaders,
     "content-type": "application/json; charset=utf-8",
     "content-length": body.length,
   });
