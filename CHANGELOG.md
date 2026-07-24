@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.3 - 2026-07-24
+
+Responses SSE failover and observability release.
+
+### Added
+
+- Classified `response.failed`, `response.incomplete`, `error`, and `response.error` events across arbitrary SSE chunk boundaries.
+- Ignored comments, heartbeats, empty events, and `[DONE]` until real upstream data exists.
+- Recorded provider, upstream HTTP status, and sanitized upstream request id for every routing attempt.
+
+### Fixed
+
+- Failed or empty Responses streams now fail over before any bytes are committed to Codex.
+- A failure after the first committed event still terminates the current stream without replaying the request to another provider.
+- Bounded pre-commit SSE buffering and preserved a final real event without a trailing blank-line delimiter.
+
 ## 0.3.2 - 2026-07-23
 
 Responses compatibility and compressed-stream hardening release.

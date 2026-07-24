@@ -17,6 +17,11 @@ import {
   restoreNamespacedSseChunk,
 } from "./namespace-transform";
 import { prepareResponsesRequest } from "./responses-compat";
+import {
+  createResponsesSseState,
+  inspectResponsesSseChunk,
+  ResponsesSseFailure,
+} from "./sse-events";
 
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const BLOCKED_REQUEST_HEADERS = new Set([
@@ -44,6 +49,7 @@ const BLOCKED_RESPONSE_HEADERS = new Set([
   "transfer-encoding",
   "upgrade",
 ]);
+const MAX_PENDING_SSE_BYTES = 1 * 1024 * 1024;
 
 type CircuitEntry = {
   state: "closed" | "open" | "half-open";
@@ -53,13 +59,15 @@ type CircuitEntry = {
 };
 
 type AttemptResult =
-  | { outcome: "success" }
-  | { outcome: "neutral" }
+  | { outcome: "success"; upstreamRequestId?: string; upstreamStatus?: number }
+  | { outcome: "neutral"; upstreamRequestId?: string; upstreamStatus?: number }
   | {
       outcome: "retry";
       retryReason: string;
       failureKind: "provider" | "request";
       requestStatus?: 400 | 413;
+      upstreamRequestId?: string;
+      upstreamStatus?: number;
     };
 
 export type RouterServer = {
@@ -157,10 +165,12 @@ export function createRouterServer(args: {
 
       if (result.outcome === "success") {
         markCircuitSuccess(circuits.get(providerName)!);
+        logAttempt(args.logger, providerName, result);
         return;
       }
       if (result.outcome === "neutral") {
         markCircuitNeutral(circuits.get(providerName)!);
+        logAttempt(args.logger, providerName, result);
         return;
       }
 
@@ -169,11 +179,11 @@ export function createRouterServer(args: {
       if (result.failureKind === "provider") {
         hasProviderFailure = true;
         markCircuitFailure(circuits.get(providerName)!, args.config);
-        args.logger?.(`provider=${providerName} failover=${reason}`);
+        logAttempt(args.logger, providerName, result);
       } else {
         requestFailureStatus = result.requestStatus ?? requestFailureStatus;
         markCircuitNeutral(circuits.get(providerName)!);
-        args.logger?.(`provider=${providerName} request_rejected=${reason}`);
+        logAttempt(args.logger, providerName, result);
       }
     }
   });
@@ -183,6 +193,20 @@ export function createRouterServer(args: {
   });
 
   return { server, getCircuits };
+}
+
+function logAttempt(logger: ((message: string) => void) | undefined, providerName: string, result: AttemptResult): void {
+  if (!logger) {
+    return;
+  }
+  const requestId = result.upstreamRequestId ?? "none";
+  const status = result.upstreamStatus === undefined ? "unknown" : String(result.upstreamStatus);
+  if (result.outcome === "retry") {
+    const category = result.failureKind === "provider" ? "failover" : "request_rejected";
+    logger(`provider=${providerName} ${category}=${result.retryReason} upstream_status=${status} upstream_request_id=${requestId}`);
+    return;
+  }
+  logger(`provider=${providerName} outcome=${result.outcome} upstream_status=${status} upstream_request_id=${requestId}`);
 }
 
 /**
@@ -383,7 +407,12 @@ function forwardAttempt(args: {
     let requestTimer: NodeJS.Timeout | null = null;
     let streamIdleTimer: NodeJS.Timeout | null = null;
     let upstreamResponse: http.IncomingMessage | null = null;
+    let upstreamRequestId: string | undefined;
+    let upstreamStatus: number | undefined;
     const namespaceSseState = createNamespaceSseState();
+    const responsesSseState = createResponsesSseState();
+    const pendingSseChunks: Buffer[] = [];
+    let pendingSseBytes = 0;
 
     const finish = (result: AttemptResult): void => {
       if (settled) {
@@ -396,28 +425,29 @@ function forwardAttempt(args: {
       resolve(result);
     };
 
-    const fail = (reason: string): void => {
+    const fail = (reason: string, requestId?: string): void => {
       if (settled) {
         return;
       }
+      upstreamRequestId ??= requestId;
       if (committed) {
+        finish({ outcome: responseOutcome, upstreamRequestId, upstreamStatus });
         upstreamResponse?.destroy();
         upstreamRequest.destroy();
         args.response.destroy();
         // The response is already committed, so replay is unsafe and the provider did
         // deliver usable data. Do not poison its circuit because the stream closed late.
-        finish({ outcome: responseOutcome });
         return;
       }
+      finish({ outcome: "retry", retryReason: reason, failureKind: "provider", upstreamRequestId, upstreamStatus });
       upstreamResponse?.destroy();
       upstreamRequest.destroy();
-      finish({ outcome: "retry", retryReason: reason, failureKind: "provider" });
     };
 
     const clientAborted = (): void => {
       upstreamResponse?.destroy();
       upstreamRequest.destroy();
-      finish({ outcome: committed ? responseOutcome : "neutral" });
+      finish({ outcome: committed ? responseOutcome : "neutral", upstreamRequestId, upstreamStatus });
     };
     const clientClosed = (): void => {
       if (!args.response.writableEnded) {
@@ -446,10 +476,18 @@ function forwardAttempt(args: {
     upstreamRequest.once("response", (candidateResponse) => {
       upstreamResponse = candidateResponse;
       const statusCode = candidateResponse.statusCode ?? 502;
+      upstreamStatus = statusCode;
+      upstreamRequestId = getUpstreamRequestId(candidateResponse.headers);
       if (isRetryableStatus(statusCode)) {
         candidateResponse.resume();
         candidateResponse.destroy();
-        finish({ outcome: "retry", retryReason: `HTTP ${statusCode}`, failureKind: "provider" });
+        finish({
+          outcome: "retry",
+          retryReason: `HTTP ${statusCode}`,
+          failureKind: "provider",
+          upstreamRequestId,
+          upstreamStatus,
+        });
         return;
       }
       responseOutcome = statusCode >= 200 && statusCode < 300 ? "success" : "neutral";
@@ -512,18 +550,47 @@ function forwardAttempt(args: {
           bufferedChunks.push(chunk);
           return;
         }
-        resetStreamIdleTimer();
+        const inspection = inspectResponsesSseChunk(responsesSseState, chunk);
+        upstreamRequestId ??= inspection.requestId;
+        const failure = inspection.failures[0];
+        if (failure && !committed) {
+          fail(formatSseFailureReason(failure), failure.requestId);
+          return;
+        }
+        if (inspection.hasRealData) {
+          resetStreamIdleTimer();
+        }
         const outputChunk = restoreNamespacedSseChunk(
           namespaceSseState,
           chunk,
           preparedRequest.restoreMap
         );
-        if (outputChunk.length > 0) {
-          commitStreamingResponse();
-          if (!args.response.write(outputChunk)) {
-            candidateResponse.pause();
-            args.response.once("drain", () => candidateResponse.resume());
+        if (outputChunk.length === 0) {
+          return;
+        }
+        if (!committed && !inspection.hasRealData) {
+          if (isPotentialSseData(outputChunk)) {
+            pendingSseChunks.push(outputChunk);
+            pendingSseBytes += outputChunk.length;
+            if (pendingSseBytes > MAX_PENDING_SSE_BYTES) {
+              fail("SSE pre-commit buffer exceeded");
+            }
           }
+          return;
+        }
+        if (!committed) {
+          commitStreamingResponse();
+          for (const pendingChunk of pendingSseChunks.splice(0)) {
+            pendingSseBytes -= pendingChunk.length;
+            if (!args.response.write(pendingChunk)) {
+              candidateResponse.pause();
+              args.response.once("drain", () => candidateResponse.resume());
+            }
+          }
+        }
+        if (!args.response.write(outputChunk)) {
+          candidateResponse.pause();
+          args.response.once("drain", () => candidateResponse.resume());
         }
       });
       candidateResponse.once("end", () => {
@@ -532,22 +599,44 @@ function forwardAttempt(args: {
           return;
         }
         if (streamResponse) {
+          const trailingInspection = inspectResponsesSseChunk(
+            responsesSseState,
+            Buffer.alloc(0),
+            true
+          );
+          upstreamRequestId ??= trailingInspection.requestId;
+          const trailingFailure = trailingInspection.failures[0];
+          if (trailingFailure && !committed) {
+            fail(formatSseFailureReason(trailingFailure), trailingFailure.requestId);
+            return;
+          }
           const trailingChunk = restoreNamespacedSseChunk(
             namespaceSseState,
             Buffer.alloc(0),
             preparedRequest.restoreMap,
             true
           );
-          if (trailingChunk.length > 0) {
+          if (trailingInspection.hasRealData) {
+            resetStreamIdleTimer();
+          }
+          if (!committed && trailingInspection.hasRealData) {
             commitStreamingResponse();
+            for (const pendingChunk of pendingSseChunks.splice(0)) {
+              pendingSseBytes -= pendingChunk.length;
+              args.response.write(pendingChunk);
+            }
+            if (trailingChunk.length > 0) {
+              args.response.write(trailingChunk);
+            }
+          } else if (trailingChunk.length > 0 && committed) {
             args.response.write(trailingChunk);
           }
           if (!committed) {
-            fail("stream ended before first byte");
+            fail("stream ended before real data");
             return;
           }
           args.response.end();
-          finish({ outcome: responseOutcome });
+          finish({ outcome: responseOutcome, upstreamRequestId, upstreamStatus });
           return;
         }
         if (requestTimer) {
@@ -580,7 +669,7 @@ function forwardAttempt(args: {
           );
         }
         args.response.end(responseBody);
-        finish({ outcome: responseOutcome });
+        finish({ outcome: responseOutcome, upstreamRequestId, upstreamStatus });
       });
       candidateResponse.once("aborted", () => fail("upstream stream aborted"));
       candidateResponse.once("error", (error) => fail(sanitizeNetworkError(error)));
@@ -721,6 +810,46 @@ function isSseResponse(response: http.IncomingMessage): boolean {
 
 function headerString(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value.join(", ") : value;
+}
+
+function getUpstreamRequestId(headers: http.IncomingHttpHeaders): string | undefined {
+  for (const name of ["x-request-id", "request-id", "openai-request-id", "x-codex-request-id"]) {
+    const value = headerString(headers[name]);
+    if (value && /^[A-Za-z0-9._:,-]{3,200}$/.test(value.trim())) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function formatSseFailureReason(failure: ResponsesSseFailure): string {
+  const message = failure.message ? ` (${sanitizeLogText(failure.message)})` : "";
+  return `SSE ${failure.type}${message}`;
+}
+
+function sanitizeLogText(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+function isPotentialSseData(chunk: Buffer): boolean {
+  const text = chunk.toString("utf8");
+  return text.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith(":") || trimmed.startsWith("retry:")) {
+      return false;
+    }
+    if (/^event:\s*(?:ping|keep-?alive|heartbeat)\s*$/i.test(trimmed)) {
+      return false;
+    }
+    if (/^data:\s*(?:\[DONE\])?\s*$/i.test(trimmed)) {
+      return false;
+    }
+    return true;
+  });
 }
 
 function writeJson(response: http.ServerResponse, statusCode: number, payload: unknown): void {

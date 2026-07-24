@@ -2,7 +2,7 @@
 
 This file is the current AI-facing fact sheet for `@airpot/codex-switch`.
 
-Current repository version: `0.3.2`
+Current repository version: `0.3.3`
 
 Current fact sources:
 
@@ -41,7 +41,7 @@ codexs route status
 codexs route stop
 ```
 
-The headless localhost worker provides strict provider priority, pre-response failover, circuit breakers, persistent local authentication across normal restarts, and activation backup restoration. It preserves the active Codex `model_provider` id so existing session history remains in the same namespace.
+The headless localhost worker provides strict provider priority, pre-response failover, circuit breakers, persistent local authentication across normal restarts, and activation backup restoration. It preserves the active Codex `model_provider` id so existing session history remains in the same namespace. Responses SSE routing classifies `response.failed`, `response.incomplete`, `error`, and `response.error`; comments, heartbeats, empty events, and `[DONE]` do not commit a response. Attempt logs include the selected provider, upstream HTTP status, and sanitized upstream request id.
 
 ## Claude Code Workflow
 

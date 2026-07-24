@@ -3,7 +3,7 @@
 `codex-switch` 是一个本地优先、无需图形界面的 Codex 与 Claude Code 中转站管理工具。它提供 `codexs` 命令，用来保存多个 OpenAI-compatible provider、切换模型与密钥、自动按优先级故障转移，并在每次修改前备份 Codex 配置。
 
 - GitHub：<https://github.com/airpot/codex-switch>
-- 当前版本：`0.3.2`
+- 当前版本：`0.3.3`
 - CLI 命令：`codexs`
 - Node.js：`>=22.13`，推荐使用最新 Node.js 22 LTS
 - Codex：面向使用顶层 `model` / `model_provider` 的当前版本，建议 `0.134.0+`
@@ -45,7 +45,7 @@ codex-switch router
 安装当前稳定标签：
 
 ```bash
-npm install -g github:airpot/codex-switch#v0.3.2
+npm install -g github:airpot/codex-switch#v0.3.3
 codexs --version
 ```
 
@@ -218,6 +218,8 @@ codexs route configure lxapi rivo \
 - TCP、TLS、DNS 等网络连接错误。
 - 首字节或完整请求超时。
 - `401`、`403`、`408`、`429` 和 `5xx` 等 provider 级失败。
+- Responses SSE 中的 `response.failed`、`response.incomplete`、`error` 或 `response.error` 事件。
+- 只有心跳、注释、空 `data` 和 `[DONE]` 的流；这些不会被当成真实输出，避免空流卡到超时。
 
 `400`、`405`、`406`、`413`、`414`、`415`、`422`、`501` 被视为请求本身的问题，不会盲目换站重放。
 
@@ -492,10 +494,16 @@ codexs route stop --force
 | `input[n].namespace unknown_parameter` | 中转站不接受 Codex Responses 的工具命名空间字段。当前版本 router 会自动压平请求并在响应中还原；升级后执行一次 `codexs route stop`、更新工具、再 `codexs route start`。 |
 | `ETIMEDOUT` | 网络路径、DNS、TCP/TLS 或地址族选择超时。`0.3.1` 已避开受影响主机上的 Node.js IPv4/IPv6 自动竞速问题；仍出现时应比较本机直连与其他服务器的 DNS、出口 IP 和区域线路。 |
 | `stream disconnected before completion` | 上游已经开始输出后断开。为了避免重复回答或重复工具调用，router 不会在另一站重放；重新发送请求并检查中转站长连接稳定性。 |
-| 压缩 SSE 后立即断流 | `0.3.2` 会对流式/转换请求强制使用 identity 编码；若上游仍违规返回压缩 SSE，会在响应提交前切换到下一 provider，而不会向 Codex 输出损坏字节。 |
+| 压缩 SSE 后立即断流 | `0.3.3` 会对流式/转换请求强制使用 identity 编码；若上游仍违规返回压缩 SSE，会在响应提交前切换到下一 provider，而不会向 Codex 输出损坏字节。 |
+| `response.failed` / `response.incomplete` / `error` | 上游在 SSE 中明确报告失败。响应尚未提交时 router 会自动切换下一 provider；已经提交过真实输出后不会重放请求，只会结束当前流。 |
+| `upstream stalled` / `empty stream` | 上游只发心跳、空事件，或在真实事件前结束。检查 `router.log` 中的 provider、`upstream_status` 和 `upstream_request_id`，并直接测试该中转站。 |
 | `ECONNREFUSED 127.0.0.1:15721` | router 没有运行或状态陈旧。运行 `codexs route status`，必要时停止陈旧状态后重新启动。 |
 | 启用路由后旧会话不可见 | 当前 `model_provider` id 发生了变化。使用 `current` / `config show` 核对，后续不要为更新 URL、token 或模型改 id。 |
 | `LIVE_STATE_DRIFT` | 路由运行期间 `config.toml` 或 `auth.json` 被其他程序改动。先检查差异，只有确认恢复备份时才使用 `route stop --force`。 |
+
+路由日志不会记录 API key 或本地 bearer token。每次尝试会记录类似
+`provider=lxapi outcome=success upstream_status=200 upstream_request_id=req-123`；失败切换会记录
+`provider=lxapi failover=SSE response.failed ... upstream_request_id=req-123`。
 
 ### 不经过 router 测试中转站
 

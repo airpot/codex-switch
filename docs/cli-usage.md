@@ -1,12 +1,12 @@
 # CLI Usage
 
-This document describes the current `0.3.2` repository CLI contract for `@airpot/codex-switch`.
+This document describes the current `0.3.3` repository CLI contract for `@airpot/codex-switch`.
 
 `codex-switch` is a local-first provider/model-provider management CLI for Codex. It manages local provider records and projects the active Codex route into `config.toml` and `auth.json`.
 
 ## Version
 
-Current package version: `0.3.2`
+Current package version: `0.3.3`
 
 This line targets Codex `0.134.0+`, where the active route is selected by top-level `model` plus `model_provider`. Legacy top-level `profile` and `[profiles.*]` sections may still be inspected for migration/adoption, but they are not the recommended managed route.
 
@@ -58,7 +58,7 @@ Starts the authenticated headless worker, waits for health, and then backs up an
 
 ### `route status`
 
-Reports configured order, process health, and live circuit state without returning the local token or upstream API keys.
+Reports configured order, process health, and live circuit state without returning the local token or upstream API keys. Runtime attempt details are written to `~/.config/codex-switch/router.log`; entries include the provider, upstream status, and sanitized request id.
 
 ### `route stop`
 

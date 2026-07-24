@@ -60,7 +60,7 @@ async function createUpstream(handler) {
   return { server, port, baseUrl: `http://127.0.0.1:${port}/v1` };
 }
 
-async function createTestRouter(providers, overrides = {}) {
+async function createTestRouter(providers, overrides = {}, logger) {
   const { createRouterServer } = require("../dist/runtime/router-server.js");
   const token = "local-router-token";
   const config = {
@@ -75,7 +75,7 @@ async function createTestRouter(providers, overrides = {}) {
     requestTimeoutMs: 3000,
     ...overrides,
   };
-  const router = createRouterServer({ config, providers: { providers }, token });
+  const router = createRouterServer({ config, providers: { providers }, token, logger });
   const port = await listen(router.server);
   return { ...router, port, token };
 }
@@ -367,6 +367,94 @@ module.exports = {
           assert.equal(result.status, 200);
           assert.equal(seenContentEncoding, null);
           assert.equal(seen.tools[0].name, "n__f");
+        } finally {
+          await close(router.server);
+          await close(upstream.server);
+        }
+      },
+    },
+    {
+      name: "heartbeats do not commit the response and fail over to the next provider",
+      async run() {
+        let secondaryCalls = 0;
+        const primary = await createUpstream((_req, res) => {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end(": ping\n\n");
+        });
+        const secondary = await createUpstream((_req, res) => {
+          secondaryCalls += 1;
+          res.writeHead(200, { "content-type": "text/event-stream", "x-request-id": "secondary-123" });
+          res.end('data: {"type":"response.completed"}\n\n');
+        });
+        const router = await createTestRouter({
+          lxapi: { profile: "lxapi", apiKey: "sk-lxapi", model: "lx", baseUrl: primary.baseUrl },
+          rivo: { profile: "rivo", apiKey: "sk-rivo", model: "rivo", baseUrl: secondary.baseUrl },
+        });
+        try {
+          const result = await request(router.port, router.token, { model: "client-model", input: "hello", stream: true });
+          assert.equal(result.status, 200);
+          assert.equal(result.body, 'data: {"type":"response.completed"}\n\n');
+          assert.equal(secondaryCalls, 1);
+          assert.equal(router.getCircuits()[0].consecutiveFailures, 1);
+        } finally {
+          await close(router.server);
+          await close(primary.server);
+          await close(secondary.server);
+        }
+      },
+    },
+    {
+      name: "failed SSE events fail over before committing and retain upstream request ids in logs",
+      async run() {
+        const logs = [];
+        let secondaryCalls = 0;
+        const primary = await createUpstream((_req, res) => {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('event: response.failed\ndata: {"type":"response.failed","request_id":"primary-456","error":{"message":"no channel"}}\n\n');
+        });
+        const secondary = await createUpstream((_req, res) => {
+          secondaryCalls += 1;
+          res.writeHead(200, { "content-type": "text/event-stream", "x-request-id": "secondary-789" });
+          res.end('data: {"type":"response.output_text.delta","delta":"ok"}\n\n');
+        });
+        const router = await createTestRouter({
+          lxapi: { profile: "lxapi", apiKey: "sk-lxapi", model: "lx", baseUrl: primary.baseUrl },
+          rivo: { profile: "rivo", apiKey: "sk-rivo", model: "rivo", baseUrl: secondary.baseUrl },
+        }, {}, (message) => logs.push(message));
+        try {
+          const result = await request(router.port, router.token, { model: "client-model", input: "hello", stream: true });
+          assert.equal(result.status, 200);
+          assert.equal(result.body, 'data: {"type":"response.output_text.delta","delta":"ok"}\n\n');
+          assert.equal(secondaryCalls, 1);
+          assert.ok(
+            logs.some((line) => line.includes("provider=lxapi") && line.includes("SSE response.failed") && line.includes("upstream_request_id=primary-456")),
+            logs.join("\n")
+          );
+          assert.ok(
+            logs.some((line) => line.includes("provider=rivo") && line.includes("outcome=success") && line.includes("upstream_request_id=secondary-789")),
+            logs.join("\n")
+          );
+        } finally {
+          await close(router.server);
+          await close(primary.server);
+          await close(secondary.server);
+        }
+      },
+    },
+    {
+      name: "native SSE preserves a final real event without a trailing delimiter",
+      async run() {
+        const upstream = await createUpstream((_req, res) => {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end('data: {"type":"response.completed"}');
+        });
+        const router = await createTestRouter({
+          native: { profile: "native", apiKey: "sk-native", model: "m", baseUrl: upstream.baseUrl, responsesCompatibility: "native" },
+        });
+        try {
+          const result = await request(router.port, router.token, { model: "client-model", input: "hello", stream: true });
+          assert.equal(result.status, 200);
+          assert.equal(result.body, 'data: {"type":"response.completed"}');
         } finally {
           await close(router.server);
           await close(upstream.server);
