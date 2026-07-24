@@ -309,6 +309,36 @@ module.exports = {
       },
     },
     {
+      name: "strict routing preserves prompt cache key and retention upstream",
+      async run() {
+        let upstreamBody = null;
+        const upstream = await createUpstream(async (req, res) => {
+          upstreamBody = await readBody(req);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end('{"ok":true}');
+        });
+        const router = await createTestRouter({
+          strict: { profile: "s", apiKey: "sk", model: "m", baseUrl: upstream.baseUrl, responsesCompatibility: "strict" },
+        });
+        try {
+          const result = await request(router.port, router.token, {
+            model: "m",
+            prompt_cache_key: "stable-session-key",
+            prompt_cache_retention: "24h",
+            tools: [{ type: "namespace", name: "n", tools: [{ type: "function", name: "f", parameters: {} }] }],
+            input: "hello",
+          });
+          assert.equal(result.status, 200);
+          assert.equal(upstreamBody.prompt_cache_key, "stable-session-key");
+          assert.equal(upstreamBody.prompt_cache_retention, "24h");
+          assert.equal(upstreamBody.tools[0].type, "function");
+        } finally {
+          await close(router.server);
+          await close(upstream.server);
+        }
+      },
+    },
+    {
       name: "request compatibility errors return 400 without poisoning provider circuits",
       async run() {
         let upstreamCalls = 0;

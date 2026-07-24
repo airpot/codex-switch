@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.4 - 2026-07-24
+
+Prompt-cache preservation hotfix.
+
+### Fixed
+
+- Preserved client-provided `prompt_cache_key` and `prompt_cache_retention` in the default `strict` Responses compatibility mode.
+- Kept namespace flattening for strict third-party relays without applying the xAI-only cache-retention removal to `lxapi` or `rivo`.
+- Added transform-level and router-level regression coverage for cache-routing fields.
+
 ## 0.3.3 - 2026-07-24
 
 Responses SSE failover and observability release.

@@ -6,8 +6,9 @@ import {
   transformNamespacedRequest,
 } from "./namespace-transform";
 
-const STRICT_TOP_LEVEL_FIELDS = ["prompt_cache_retention", "safety_identifier"];
+const STRICT_TOP_LEVEL_FIELDS = ["safety_identifier"];
 const STRICT_RECURSIVE_FIELDS = ["external_web_access"];
+const XAI_TOP_LEVEL_FIELDS = ["prompt_cache_retention"];
 const XAI_GROK_45_FIELDS = [
   "presence_penalty",
   "presencePenalty",
@@ -100,6 +101,9 @@ function sanitizeStrictPayload(payload: Record<string, any>): boolean {
 
 function sanitizeXaiPayload(payload: Record<string, any>): boolean {
   let changed = false;
+  for (const field of XAI_TOP_LEVEL_FIELDS) {
+    changed = deleteField(payload, field) || changed;
+  }
   if (targetsGrok45(payload.model)) {
     for (const field of XAI_GROK_45_FIELDS) {
       changed = deleteField(payload, field) || changed;

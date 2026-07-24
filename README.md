@@ -3,7 +3,7 @@
 `codex-switch` 是一个本地优先、无需图形界面的 Codex 与 Claude Code 中转站管理工具。它提供 `codexs` 命令，用来保存多个 OpenAI-compatible provider、切换模型与密钥、自动按优先级故障转移，并在每次修改前备份 Codex 配置。
 
 - GitHub：<https://github.com/airpot/codex-switch>
-- 当前版本：`0.3.3`
+- 当前版本：`0.3.4`
 - CLI 命令：`codexs`
 - Node.js：`>=22.13`，推荐使用最新 Node.js 22 LTS
 - Codex：面向使用顶层 `model` / `model_provider` 的当前版本，建议 `0.134.0+`
@@ -45,7 +45,7 @@ codex-switch router
 安装当前稳定标签：
 
 ```bash
-npm install -g github:airpot/codex-switch#v0.3.3
+npm install -g github:airpot/codex-switch#v0.3.4
 codexs --version
 ```
 
@@ -240,7 +240,7 @@ router 会在发送到 provider 前把命名空间工具压平成兼容的函数
 
 | 模式 | 用途 |
 | --- | --- |
-| `strict` | 默认。压平 namespace，清理严格第三方 Responses 网关不接受的私有字段，并保持响应可逆 |
+| `strict` | 默认。压平 namespace，清理严格第三方 Responses 网关不接受的私有字段，保留 `prompt_cache_key` / `prompt_cache_retention`，并保持响应可逆 |
 | `native` | 不改写请求。只用于明确支持 Codex namespace 扩展的原生 Responses 上游 |
 | `xai` | 在 `strict` 基础上增加 xAI 工具白名单及 grok-4.5 参数清理 |
 
@@ -497,6 +497,7 @@ codexs route stop --force
 | 压缩 SSE 后立即断流 | `0.3.3` 会对流式/转换请求强制使用 identity 编码；若上游仍违规返回压缩 SSE，会在响应提交前切换到下一 provider，而不会向 Codex 输出损坏字节。 |
 | `response.failed` / `response.incomplete` / `error` | 上游在 SSE 中明确报告失败。响应尚未提交时 router 会自动切换下一 provider；已经提交过真实输出后不会重放请求，只会结束当前流。 |
 | `upstream stalled` / `empty stream` | 上游只发心跳、空事件，或在真实事件前结束。检查 `router.log` 中的 provider、`upstream_status` 和 `upstream_request_id`，并直接测试该中转站。 |
+| 输入 token 很大、缓存命中异常 | 长会话会在每次工具调用时重复携带上下文。`0.3.4` 起 `strict` 路由保留 Codex 的 `prompt_cache_key` 与 `prompt_cache_retention`；不同 provider 的缓存仍彼此隔离，failover 后首个请求可能冷启动。 |
 | `ECONNREFUSED 127.0.0.1:15721` | router 没有运行或状态陈旧。运行 `codexs route status`，必要时停止陈旧状态后重新启动。 |
 | 启用路由后旧会话不可见 | 当前 `model_provider` id 发生了变化。使用 `current` / `config show` 核对，后续不要为更新 URL、token 或模型改 id。 |
 | `LIVE_STATE_DRIFT` | 路由运行期间 `config.toml` 或 `auth.json` 被其他程序改动。先检查差异，只有确认恢复备份时才使用 `route stop --force`。 |

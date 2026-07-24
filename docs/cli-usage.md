@@ -1,12 +1,12 @@
 # CLI Usage
 
-This document describes the current `0.3.3` repository CLI contract for `@airpot/codex-switch`.
+This document describes the current `0.3.4` repository CLI contract for `@airpot/codex-switch`.
 
 `codex-switch` is a local-first provider/model-provider management CLI for Codex. It manages local provider records and projects the active Codex route into `config.toml` and `auth.json`.
 
 ## Version
 
-Current package version: `0.3.3`
+Current package version: `0.3.4`
 
 This line targets Codex `0.134.0+`, where the active route is selected by top-level `model` plus `model_provider`. Legacy top-level `profile` and `[profiles.*]` sections may still be inspected for migration/adoption, but they are not the recommended managed route.
 
@@ -80,7 +80,7 @@ codexs add <provider> --profile <model-provider-id> --model <model> --api-key <k
 
 Adds a provider to `providers.json`, creates or updates the matching `[model_providers.<id>]` section, and backs up managed files before writing.
 
-`strict` is the default Responses compatibility mode for third-party relays. `native` preserves Codex namespace extensions unchanged. `xai` adds xAI-specific request filtering.
+`strict` is the default Responses compatibility mode for third-party relays. It flattens namespace tools while preserving `prompt_cache_key` and `prompt_cache_retention`. `native` preserves Codex namespace extensions unchanged. `xai` adds xAI-specific request filtering.
 
 ### `edit`
 

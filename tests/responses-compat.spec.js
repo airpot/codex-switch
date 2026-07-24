@@ -9,11 +9,12 @@ module.exports = {
   name: "Responses compatibility profiles",
   tests: [
     {
-      name: "strict mode removes private fields and promotes additional tools",
+      name: "strict mode preserves prompt-cache routing while normalizing private fields",
       run() {
         const body = Buffer.from(JSON.stringify({
           model: "gpt-5",
           prompt_cache_retention: "24h",
+          prompt_cache_key: "stable-session-key",
           safety_identifier: "private",
           external_web_access: true,
           tools: [{ type: "function", name: "existing", parameters: {} }],
@@ -25,7 +26,8 @@ module.exports = {
         const transformed = prepareResponsesRequest(body, "application/json", "strict");
         const payload = JSON.parse(transformed.body.toString("utf8"));
         assert.equal(transformed.changed, true);
-        assert.equal("prompt_cache_retention" in payload, false);
+        assert.equal(payload.prompt_cache_retention, "24h");
+        assert.equal(payload.prompt_cache_key, "stable-session-key");
         assert.equal("safety_identifier" in payload, false);
         assert.equal("external_web_access" in payload, false);
         assert.deepEqual(payload.tools.map((tool) => tool.name), ["existing", "extra"]);
@@ -39,6 +41,7 @@ module.exports = {
       run() {
         const body = Buffer.from(JSON.stringify({
           model: "prefix/grok-4.5",
+          prompt_cache_retention: "24h",
           stop: ["x"],
           tools: [{ type: "function", name: "kept" }, { type: "custom", name: "removed" }],
           tool_choice: { type: "custom", name: "removed" },
@@ -50,6 +53,7 @@ module.exports = {
         const xai = prepareResponsesRequest(body, "application/json", "xai");
         const payload = JSON.parse(xai.body.toString("utf8"));
         assert.deepEqual(payload.tools.map((tool) => tool.name), ["kept"]);
+        assert.equal("prompt_cache_retention" in payload, false);
         assert.equal("tool_choice" in payload, false);
         assert.equal("stop" in payload, false);
       },
